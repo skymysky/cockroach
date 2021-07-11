@@ -1,39 +1,42 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // +build !windows
 
 package security_test
 
 import (
+	"context"
+	gosql "database/sql"
+	"encoding/json"
 	"io/ioutil"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
-	"syscall"
+	"regexp"
+	"strings"
 	"testing"
 
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
+	"golang.org/x/sys/unix"
 )
 
 // TestRotateCerts tests certs rotation in the server.
@@ -41,6 +44,8 @@ import (
 // of triggering a certificate refresh.
 func TestRotateCerts(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.ScopeWithoutShowLogs(t).Close(t)
+
 	// Do not mock cert access for this test.
 	security.ResetAssetLoader()
 	defer ResetTest()
@@ -54,16 +59,20 @@ func TestRotateCerts(t *testing.T) {
 		}
 	}()
 
-	if err := generateAllCerts(certsDir); err != nil {
+	if err := generateBaseCerts(certsDir); err != nil {
 		t.Fatal(err)
 	}
 
 	// Start a test server with first set of certs.
+	// Web session authentication is disabled in order to avoid the need to
+	// authenticate the individual clients being instantiated (session auth has
+	// no effect on what is being tested here).
 	params := base.TestServerArgs{
-		SSLCertsDir: certsDir,
+		SSLCertsDir:                     certsDir,
+		DisableWebSessionAuthentication: true,
 	}
 	s, _, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	// Client test function.
 	clientTest := func(httpClient http.Client) error {
@@ -83,15 +92,37 @@ func TestRotateCerts(t *testing.T) {
 		return nil
 	}
 
+	// Create a client by calling sql.Open which loads the certificates but do not use it yet.
+	createTestClient := func() *gosql.DB {
+		pgUrl := makeSecurePGUrl(s.ServingSQLAddr(), security.RootUser, certsDir, security.EmbeddedCACert, security.EmbeddedRootCert, security.EmbeddedRootKey)
+		goDB, err := gosql.Open("postgres", pgUrl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return goDB
+	}
+
+	// Some errors codes.
+	const kBadAuthority = "certificate signed by unknown authority"
+	const kBadCertificate = "tls: bad certificate"
+
 	// Test client with the same certs.
 	clientContext := testutils.NewNodeTestBaseContext()
 	clientContext.SSLCertsDir = certsDir
-	firstClient, err := clientContext.GetHTTPClient()
+	firstSCtx := rpc.MakeSecurityContext(clientContext, security.CommandTLSSettings{}, roachpb.SystemTenantID)
+	firstClient, err := firstSCtx.GetHTTPClient()
 	if err != nil {
 		t.Fatalf("could not create http client: %v", err)
 	}
 
 	if err := clientTest(firstClient); err != nil {
+		t.Fatal(err)
+	}
+
+	firstSQLClient := createTestClient()
+	defer firstSQLClient.Close()
+
+	if _, err := firstSQLClient.Exec("SELECT 1"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -100,7 +131,7 @@ func TestRotateCerts(t *testing.T) {
 	if err := os.RemoveAll(certsDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := generateAllCerts(certsDir); err != nil {
+	if err := generateBaseCerts(certsDir); err != nil {
 		t.Fatal(err)
 	}
 
@@ -109,13 +140,22 @@ func TestRotateCerts(t *testing.T) {
 	// Fails on crypto errors.
 	clientContext = testutils.NewNodeTestBaseContext()
 	clientContext.SSLCertsDir = certsDir
-	secondClient, err := clientContext.GetHTTPClient()
+
+	secondSCtx := rpc.MakeSecurityContext(clientContext, security.CommandTLSSettings{}, roachpb.SystemTenantID)
+	secondClient, err := secondSCtx.GetHTTPClient()
 	if err != nil {
 		t.Fatalf("could not create http client: %v", err)
 	}
 
-	if err := clientTest(secondClient); !testutils.IsError(err, "unknown authority") {
-		t.Fatalf("expected unknown authority error, got: %q", err)
+	if err := clientTest(secondClient); !testutils.IsError(err, kBadAuthority) {
+		t.Fatalf("expected error %q, got: %q", kBadAuthority, err)
+	}
+
+	secondSQLClient := createTestClient()
+	defer secondSQLClient.Close()
+
+	if _, err := secondSQLClient.Exec("SELECT 1"); !testutils.IsError(err, kBadAuthority) {
+		t.Fatalf("expected error %q, got: %q", kBadAuthority, err)
 	}
 
 	// We haven't triggered the reload, first client should still work.
@@ -123,12 +163,17 @@ func TestRotateCerts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Log("issuing SIGHUP")
-	if err := syscall.Kill(syscall.Getpid(), syscall.SIGHUP); err != nil {
+	if _, err := firstSQLClient.Exec("SELECT 1"); err != nil {
 		t.Fatal(err)
 	}
 
-	// Try again, the first client should now fail, the second should succeed.
+	beforeReload := timeutil.Now()
+	t.Log("issuing SIGHUP")
+	if err := unix.Kill(unix.Getpid(), unix.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+
+	// Try again, the first HTTP client should now fail, the second should succeed.
 	testutils.SucceedsSoon(t,
 		func() error {
 			if err := clientTest(firstClient); !testutils.IsError(err, "unknown authority") {
@@ -141,29 +186,84 @@ func TestRotateCerts(t *testing.T) {
 			return nil
 		})
 
+	// Check that the structured event was logged.
+	// We use SucceedsSoon here because there may be a delay between
+	// the moment SIGHUP is processed and certs are reloaded, and
+	// the moment the structured logging event is actually
+	// written to the log file.
+	testutils.SucceedsSoon(t, func() error {
+		log.Flush()
+		entries, err := log.FetchEntriesFromFiles(beforeReload.UnixNano(),
+			math.MaxInt64, 10000, cmLogRe, log.WithMarkedSensitiveData)
+		if err != nil {
+			t.Fatal(err)
+		}
+		foundEntry := false
+		for _, e := range entries {
+			if !strings.Contains(e.Message, "certs_reload") {
+				continue
+			}
+			foundEntry = true
+			// TODO(knz): Remove this when crdb-v2 becomes the new format.
+			e.Message = strings.TrimPrefix(e.Message, "Structured entry:")
+			// crdb-v2 starts json with an equal sign.
+			e.Message = strings.TrimPrefix(e.Message, "=")
+			jsonPayload := []byte(e.Message)
+			var ev eventpb.CertsReload
+			if err := json.Unmarshal(jsonPayload, &ev); err != nil {
+				t.Errorf("unmarshalling %q: %v", e.Message, err)
+			}
+			if ev.Success != true || ev.ErrorMessage != "" {
+				t.Errorf("incorrect event: expected success with no error, got %+v", ev)
+			}
+		}
+		if !foundEntry {
+			return errors.New("structured entry for certs_reload not found in log")
+		}
+		return nil
+	})
+
+	// Nothing changed in the first SQL client: the connection is already established.
+	if _, err := firstSQLClient.Exec("SELECT 1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// However, the second SQL client now succeeds.
+	if _, err := secondSQLClient.Exec("SELECT 1"); err != nil {
+		t.Fatal(err)
+	}
+
 	// Now regenerate certs, but keep the CA cert around.
 	// We still need to delete the key.
-	// New clients will fail with bad certificate (CA not yet loaded).
+	// New clients with certs will fail with bad certificate (CA not yet loaded).
 	if err := os.Remove(filepath.Join(certsDir, security.EmbeddedCAKey)); err != nil {
 		t.Fatal(err)
 	}
-	if err := generateAllCerts(certsDir); err != nil {
+	if err := generateBaseCerts(certsDir); err != nil {
 		t.Fatal(err)
 	}
 
 	// Setup a third http client. It will load the new certs.
 	// We need to use a new context as it keeps the certificate manager around.
-	// Fails on crypto errors.
+	// This is HTTP and succeeds because we do not ask for or verify client certificates.
 	clientContext = testutils.NewNodeTestBaseContext()
 	clientContext.SSLCertsDir = certsDir
-	thirdClient, err := clientContext.GetHTTPClient()
+	thirdSCtx := rpc.MakeSecurityContext(clientContext, security.CommandTLSSettings{}, roachpb.SystemTenantID)
+	thirdClient, err := thirdSCtx.GetHTTPClient()
 	if err != nil {
 		t.Fatalf("could not create http client: %v", err)
 	}
 
-	// client3 fails on bad certificate, because the node does not have the new CA.
-	if err := clientTest(thirdClient); !testutils.IsError(err, "tls: bad certificate") {
-		t.Fatalf("expected bad certificate error, got: %q", err)
+	if err := clientTest(thirdClient); err != nil {
+		t.Fatal(err)
+	}
+
+	// However, a SQL client uses client certificates. The node does not have the new CA yet.
+	thirdSQLClient := createTestClient()
+	defer thirdSQLClient.Close()
+
+	if _, err := thirdSQLClient.Exec("SELECT 1"); !testutils.IsError(err, kBadCertificate) {
+		t.Fatalf("expected error %q, got: %q", kBadCertificate, err)
 	}
 
 	// We haven't triggered the reload, second client should still work.
@@ -172,19 +272,21 @@ func TestRotateCerts(t *testing.T) {
 	}
 
 	t.Log("issuing SIGHUP")
-	if err := syscall.Kill(syscall.Getpid(), syscall.SIGHUP); err != nil {
+	if err := unix.Kill(unix.Getpid(), unix.SIGHUP); err != nil {
 		t.Fatal(err)
 	}
 
-	// client2 fails on bad CA for the node certs, client3 succeeds.
+	// Wait until client3 succeeds (both http and sql).
 	testutils.SucceedsSoon(t,
 		func() error {
-			if err := clientTest(secondClient); !testutils.IsError(err, "unknown authority") {
-				return errors.Errorf("expected unknown authority, got %v", err)
-			}
 			if err := clientTest(thirdClient); err != nil {
-				return errors.Errorf("third client failed: %v", err)
+				return errors.Errorf("third HTTP client failed: %v", err)
+			}
+			if _, err := thirdSQLClient.Exec("SELECT 1"); err != nil {
+				return errors.Errorf("third SQL client failed: %v", err)
 			}
 			return nil
 		})
 }
+
+var cmLogRe = regexp.MustCompile(`event_log\.go`)

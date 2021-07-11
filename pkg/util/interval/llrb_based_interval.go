@@ -1,12 +1,25 @@
 // Copyright ©2012 The bíogo Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// license that can be found in licenses/BSD-biogo.txt.
+
+// Portions of this file are additionally subject to the following
+// license and copyright.
+//
+// Copyright 2016 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
+// This code originated in the github.com/biogo/store/interval package.
 
 package interval
 
-import (
-	"github.com/biogo/store/llrb"
-)
+import "github.com/biogo/store/llrb"
 
 // Operation LLRBMode of the underlying LLRB tree.
 const (
@@ -37,8 +50,8 @@ type llrbTree struct {
 	Overlapper Overlapper
 }
 
-// newLLBRTree creates a new interval tree with the given overlapper function.
-func newLLBRTree(overlapper Overlapper) *llrbTree {
+// newLLRBTree creates a new interval tree with the given overlapper function.
+func newLLRBTree(overlapper Overlapper) *llrbTree {
 	return &llrbTree{Overlapper: overlapper}
 }
 
@@ -651,4 +664,13 @@ func (t *llrbTree) Iterator() TreeIterator {
 		ti.stack = append(ti.stack, n)
 	}
 	return &ti
+}
+
+func (t *llrbTree) Clear() {
+	t.Root = nil
+	t.Count = 0
+}
+
+func (t *llrbTree) Clone() Tree {
+	panic("unimplemented")
 }

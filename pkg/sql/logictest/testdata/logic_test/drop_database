@@ -1,54 +1,70 @@
-# LogicTest: default
+statement ok
+SET CLUSTER SETTING sql.cross_db_views.enabled = TRUE
 
 statement ok
 CREATE DATABASE "foo-bar"
 
-query T
+query TTTTT
 SHOW DATABASES
 ----
-crdb_internal
-foo-bar
-information_schema
-pg_catalog
-system
-test
+defaultdb  root  NULL  {}  NULL
+foo-bar    root  NULL  {}  NULL
+postgres   root  NULL  {}  NULL
+system     node  NULL  {}  NULL
+test       root  NULL  {}  NULL
 
 statement ok
-DROP DATABASE "foo-bar"
+CREATE TABLE "foo-bar".t(x INT)
 
-query T
+statement error database.*is not empty and RESTRICT was specified
+DROP DATABASE "foo-bar" RESTRICT
+
+statement ok
+DROP DATABASE "foo-bar" CASCADE
+
+query TTT
+SELECT name, database_name, state FROM crdb_internal.tables WHERE name = 't'
+----
+t  [53]  DROP
+
+query TTTTT
 SHOW DATABASES
 ----
-crdb_internal
-information_schema
-pg_catalog
-system
-test
+defaultdb  root  NULL  {}  NULL
+postgres   root  NULL  {}  NULL
+system     node  NULL  {}  NULL
+test       root  NULL  {}  NULL
+
+query TT
+SELECT job_type, status FROM [SHOW JOBS] WHERE user_name = 'root'
+----
+SCHEMA CHANGE     succeeded
+SCHEMA CHANGE     succeeded
+SCHEMA CHANGE     succeeded
+SCHEMA CHANGE GC  running
 
 statement ok
 CREATE DATABASE "foo bar"
 
-query T
+query TTTTT
 SHOW DATABASES
 ----
-crdb_internal
-foo bar
-information_schema
-pg_catalog
-system
-test
+defaultdb  root  NULL  {}  NULL
+foo bar    root  NULL  {}  NULL
+postgres   root  NULL  {}  NULL
+system     node  NULL  {}  NULL
+test       root  NULL  {}  NULL
 
 statement ok
-DROP DATABASE "foo bar"
+DROP DATABASE "foo bar" CASCADE
 
-query T
+query TTTTT
 SHOW DATABASES
 ----
-crdb_internal
-information_schema
-pg_catalog
-system
-test
+defaultdb  root  NULL  {}  NULL
+postgres   root  NULL  {}  NULL
+system     node  NULL  {}  NULL
+test       root  NULL  {}  NULL
 
 statement ok
 CREATE DATABASE d1
@@ -78,7 +94,7 @@ statement ok
 CREATE VIEW d2.v3 AS SELECT k,v FROM d1.v2
 
 statement ok
-CREATE VIEW d2.v4 AS SELECT COUNT(*) FROM d1.t1 as x JOIN d2.t1 as y ON x.k = y.k
+CREATE VIEW d2.v4 AS SELECT count(*) FROM d1.t1 as x JOIN d2.t1 as y ON x.k = y.k
 
 statement ok
 GRANT ALL ON DATABASE d1 TO testuser
@@ -100,8 +116,8 @@ GRANT ALL ON d2.v3 TO testuser
 
 user testuser
 
-statement error user testuser does not have DROP privilege on view v4
-DROP DATABASE d1
+statement error user testuser does not have DROP privilege on relation v4
+DROP DATABASE d1 CASCADE
 
 user root
 
@@ -126,40 +142,38 @@ SELECT * FROM d2.v4
 ----
 0
 
-query T
+query TTTTT
 SHOW DATABASES
 ----
-crdb_internal
-d1
-d2
-information_schema
-pg_catalog
-system
-test
+d1         root  NULL  {}  NULL
+d2         root  NULL  {}  NULL
+defaultdb  root  NULL  {}  NULL
+postgres   root  NULL  {}  NULL
+system     node  NULL  {}  NULL
+test       root  NULL  {}  NULL
 
 statement ok
-DROP DATABASE d1
+DROP DATABASE d1 CASCADE
 
-query T
+query TTTTT
 SHOW DATABASES
 ----
-crdb_internal
-d2
-information_schema
-pg_catalog
-system
-test
+d2         root  NULL  {}  NULL
+defaultdb  root  NULL  {}  NULL
+postgres   root  NULL  {}  NULL
+system     node  NULL  {}  NULL
+test       root  NULL  {}  NULL
 
-query error database "d1" does not exist
+query error pgcode 42P01 relation "d1.v2" does not exist
 SELECT * FROM d1.v2
 
-query error table "d2.v2" does not exist
+query error pgcode 42P01 relation "d2.v2" does not exist
 SELECT * FROM d2.v2
 
-query error table "d2.v3" does not exist
+query error pgcode 42P01 relation "d2.v3" does not exist
 SELECT * FROM d2.v3
 
-query error table "d2.v4" does not exist
+query error pgcode 42P01 relation "d2.v4" does not exist
 SELECT * FROM d2.v4
 
 query TT
@@ -167,18 +181,17 @@ SELECT * FROM d2.v1
 ----
 
 statement ok
-DROP DATABASE d2
+DROP DATABASE d2 CASCADE
 
-query T
+query TTTTT
 SHOW DATABASES
 ----
-crdb_internal
-information_schema
-pg_catalog
-system
-test
+defaultdb  root  NULL  {}  NULL
+postgres   root  NULL  {}  NULL
+system     node  NULL  {}  NULL
+test       root  NULL  {}  NULL
 
-query error database "d2" does not exist
+query error pgcode 42P01 relation "d2.v1" does not exist
 SELECT * FROM d2.v1
 
 ## drop a database containing tables with foreign key constraints, e.g. #8497
@@ -201,16 +214,129 @@ CREATE TABLE constraint_db.t2 (
 )
 
 statement ok
-DROP DATABASE constraint_db
+DROP DATABASE constraint_db CASCADE
 
-query T
+query TTTTT
 SHOW DATABASES
 ----
-crdb_internal
-information_schema
-pg_catalog
-system
-test
+defaultdb  root  NULL  {}  NULL
+postgres   root  NULL  {}  NULL
+system     node  NULL  {}  NULL
+test       root  NULL  {}  NULL
 
-query error database "constraint_db" does not exist
+query error pgcode 42P01 relation "constraint_db.t1" does not exist
 SELECT * FROM constraint_db.t1
+
+# Check that the default option is CASCADE, but that safe_updates blocks it
+
+statement ok
+CREATE DATABASE foo; CREATE TABLE foo.bar(x INT);
+
+statement ok
+SET sql_safe_updates = TRUE;
+
+statement error DROP DATABASE on current database
+DROP DATABASE test
+
+statement error DROP DATABASE on non-empty database without explicit CASCADE
+DROP DATABASE foo
+
+statement ok
+SET sql_safe_updates = FALSE; DROP DATABASE foo
+
+# Check that the default databases can be dropped and re-created like any other.
+statement OK
+DROP DATABASE defaultdb; DROP DATABASE postgres
+
+statement ok
+CREATE DATABASE defaultdb; CREATE DATABASE postgres
+
+# Test that an empty database doesn't get a GC job.
+statement ok
+CREATE DATABASE empty
+
+statement ok
+DROP DATABASE empty
+
+query TT
+SELECT job_type, status FROM [SHOW JOBS] WHERE description LIKE '%empty%'
+----
+SCHEMA CHANGE       succeeded
+
+subtest bug_50997
+
+statement ok
+CREATE DATABASE db50997
+
+statement ok
+CREATE SEQUENCE db50997.seq50997
+
+statement ok
+CREATE SEQUENCE db50997.useq50997
+
+statement ok
+CREATE TABLE db50997.t50997(a INT DEFAULT nextval('db50997.seq50997'))
+
+statement ok
+CREATE TABLE db50997.t250997(a INT DEFAULT nextval('db50997.seq50997'))
+
+statement ok
+DROP DATABASE db50997 CASCADE
+
+query I
+SELECT count(*) FROM system.namespace WHERE name = 'seq50997'
+----
+0
+
+query I
+SELECT count(*) FROM system.namespace WHERE name = 'useq50997'
+----
+0
+
+# Similar to the test above, except now the "sequence use" relationship
+# is cross database. In this case the sequence should be simply unlinked
+# (and not dropped). This wasn't broken before, but it is nice to have a test
+# that checks things behave as expected.
+statement ok
+CREATE DATABASE db50997
+
+statement ok
+CREATE SEQUENCE seq50997
+
+statement ok
+CREATE TABLE db50997.t50997(a INT DEFAULT nextval('seq50997'))
+
+statement ok
+DROP DATABASE db50997 CASCADE
+
+query I
+SELECT count(*) FROM system.namespace WHERE name LIKE 'seq50997'
+----
+1
+
+subtest regression_51782
+
+statement ok
+CREATE DATABASE db_51782
+
+statement ok
+CREATE TABLE db_51782.t_51782(a int, b int);
+
+statement ok
+CREATE VIEW db_51782.v_51782 AS SELECT a, b FROM db_51782.t_51782
+
+statement ok
+CREATE VIEW db_51782.w_51782 AS SELECT a FROM db_51782.v_51782
+
+statement ok
+DROP DATABASE db_51782 CASCADE
+
+query I
+SELECT count(*) FROM system.namespace WHERE name LIKE 'v_51782'
+----
+0
+
+query I
+SELECT count(*) FROM system.namespace WHERE name LIKE 'w_51782'
+----
+0

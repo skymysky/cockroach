@@ -1,18 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 //
 // The parallel_test adds an orchestration layer on top of the logic_test code
 // with the capability of running multiple test data files in parallel.
@@ -24,6 +18,7 @@
 package logictest
 
 import (
+	"context"
 	gosql "database/sql"
 	"flag"
 	"fmt"
@@ -33,21 +28,23 @@ import (
 	"strings"
 	"testing"
 
-	"golang.org/x/net/context"
-
-	"gopkg.in/yaml.v2"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/gogo/protobuf/proto"
+	yaml "gopkg.in/yaml.v2"
 )
 
 var (
@@ -64,7 +61,7 @@ type parallelTest struct {
 func (t *parallelTest) close() {
 	t.clients = nil
 	if t.cluster != nil {
-		t.cluster.Stopper().Stop(context.TODO())
+		t.cluster.Stopper().Stop(context.Background())
 	}
 }
 
@@ -74,15 +71,18 @@ func (t *parallelTest) processTestFile(path string, nodeIdx int, db *gosql.DB, c
 	}
 
 	// Set up a dummy logicTest structure to use that code.
+	rng, _ := randutil.NewPseudoRand()
 	l := &logicTest{
-		t:       t.T,
+		rootT:   t.T,
 		cluster: t.cluster,
 		nodeIdx: nodeIdx,
 		db:      db,
 		user:    security.RootUser,
 		verbose: testing.Verbose() || log.V(1),
+		rng:     rng,
 	}
 	if err := l.processTestFile(path, testClusterConfig{}); err != nil {
+		log.Errorf(context.Background(), "error processing %s: %s", path, err)
 		t.Error(err)
 	}
 }
@@ -91,14 +91,14 @@ func (t *parallelTest) getClient(nodeIdx, clientIdx int) *gosql.DB {
 	for len(t.clients[nodeIdx]) <= clientIdx {
 		// Add a client.
 		pgURL, cleanupFunc := sqlutils.PGUrl(t.T,
-			t.cluster.Server(nodeIdx).ServingAddr(),
+			t.cluster.Server(nodeIdx).ServingSQLAddr(),
 			"TestParallel",
 			url.User(security.RootUser))
 		db, err := gosql.Open("postgres", pgURL.String())
 		if err != nil {
 			t.Fatal(err)
 		}
-		sqlutils.MakeSQLRunner(t, db).Exec("SET DATABASE = test")
+		sqlutils.MakeSQLRunner(db).Exec(t, "SET DATABASE = test")
 		t.cluster.Stopper().AddCloser(
 			stop.CloserFn(func() {
 				_ = db.Close()
@@ -135,13 +135,12 @@ func (t *parallelTest) run(dir string) {
 		t.Fatalf("%s: %s", mainFile, err)
 	}
 	var spec parTestSpec
-	err = yaml.Unmarshal(yamlData, &spec)
-	if err != nil {
+	if err := yaml.UnmarshalStrict(yamlData, &spec); err != nil {
 		t.Fatalf("%s: %s", mainFile, err)
 	}
 
 	if spec.SkipReason != "" {
-		t.Skip(spec.SkipReason)
+		skip.IgnoreLint(t, spec.SkipReason)
 	}
 
 	log.Infof(t.ctx, "Running test %s", dir)
@@ -149,7 +148,7 @@ func (t *parallelTest) run(dir string) {
 		log.Infof(t.ctx, "spec: %+v", spec)
 	}
 
-	t.setup(&spec)
+	t.setup(context.Background(), &spec)
 	defer t.close()
 
 	for runListIdx, runList := range spec.Run {
@@ -176,7 +175,7 @@ func (t *parallelTest) run(dir string) {
 	}
 }
 
-func (t *parallelTest) setup(spec *parTestSpec) {
+func (t *parallelTest) setup(ctx context.Context, spec *parTestSpec) {
 	if spec.ClusterSize == 0 {
 		spec.ClusterSize = 1
 	}
@@ -185,45 +184,46 @@ func (t *parallelTest) setup(spec *parTestSpec) {
 		log.Infof(t.ctx, "Cluster Size: %d", spec.ClusterSize)
 	}
 
-	args := base.TestClusterArgs{
-		ServerArgs: base.TestServerArgs{
-			Knobs: base.TestingKnobs{
-				SQLExecutor: &sql.ExecutorTestingKnobs{
-					WaitForGossipUpdate:   true,
-					CheckStmtStringChange: true,
-				},
-			},
-		},
+	t.cluster = serverutils.StartNewTestCluster(t, spec.ClusterSize, base.TestClusterArgs{})
+
+	for i := 0; i < t.cluster.NumServers(); i++ {
+		server := t.cluster.Server(i)
+		mode := sessiondata.DistSQLOff
+		st := server.ClusterSettings()
+		st.Manual.Store(true)
+		sql.DistSQLClusterExecMode.Override(ctx, &st.SV, int64(mode))
+		// Disable automatic stats - they can interfere with the test shutdown.
+		stats.AutomaticStatisticsClusterMode.Override(ctx, &st.SV, false)
 	}
-	t.cluster = serverutils.StartTestCluster(t, spec.ClusterSize, args)
+
 	t.clients = make([][]*gosql.DB, spec.ClusterSize)
 	for i := range t.clients {
 		t.clients[i] = append(t.clients[i], t.cluster.ServerConn(i))
 	}
-	r0 := sqlutils.MakeSQLRunner(t, t.clients[0][0])
+	r0 := sqlutils.MakeSQLRunner(t.clients[0][0])
 
 	if spec.RangeSplitSize != 0 {
 		if testing.Verbose() || log.V(1) {
 			log.Infof(t.ctx, "Setting range split size: %d", spec.RangeSplitSize)
 		}
-		zoneCfg := config.DefaultZoneConfig()
-		zoneCfg.RangeMaxBytes = int64(spec.RangeSplitSize)
-		zoneCfg.RangeMinBytes = zoneCfg.RangeMaxBytes / 2
+		zoneCfg := zonepb.DefaultZoneConfig()
+		zoneCfg.RangeMaxBytes = proto.Int64(int64(spec.RangeSplitSize))
+		zoneCfg.RangeMinBytes = proto.Int64(*zoneCfg.RangeMaxBytes / 2)
 		buf, err := protoutil.Marshal(&zoneCfg)
 		if err != nil {
 			t.Fatal(err)
 		}
 		objID := keys.RootNamespaceID
-		r0.Exec(`UPDATE system.zones SET config = $2 WHERE id = $1`, objID, buf)
+		r0.Exec(t, `UPDATE system.zones SET config = $2 WHERE id = $1`, objID, buf)
 	}
 
 	if testing.Verbose() || log.V(1) {
 		log.Infof(t.ctx, "Creating database")
 	}
 
-	r0.Exec("CREATE DATABASE test")
+	r0.Exec(t, "CREATE DATABASE test")
 	for i := range t.clients {
-		sqlutils.MakeSQLRunner(t, t.clients[i][0]).Exec("SET DATABASE = test")
+		sqlutils.MakeSQLRunner(t.clients[i][0]).Exec(t, "SET DATABASE = test")
 	}
 
 	if testing.Verbose() || log.V(1) {
@@ -234,7 +234,14 @@ func (t *parallelTest) setup(spec *parTestSpec) {
 func TestParallel(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	glob := string(*paralleltestdata)
+	skip.UnderRace(t, "takes >1 min under race")
+	// Note: there is special code in teamcity-trigger/main.go to run this package
+	// with less concurrency in the nightly stress runs. If you see problems
+	// please make adjustments there.
+	// As of 6/4/2019, the logic tests never complete under race.
+	skip.UnderStressRace(t, "logic tests and race detector don't mix: #37993")
+
+	glob := *paralleltestdata
 	paths, err := filepath.Glob(glob)
 	if err != nil {
 		t.Fatal(err)
@@ -243,12 +250,20 @@ func TestParallel(t *testing.T) {
 		t.Fatalf("No testfiles found (glob: %s)", glob)
 	}
 	total := 0
+	failed := 0
 	for _, path := range paths {
 		t.Run(filepath.Base(path), func(t *testing.T) {
 			pt := parallelTest{T: t, ctx: context.Background()}
 			pt.run(path)
 			total++
+			if t.Failed() {
+				failed++
+			}
 		})
 	}
-	log.Infof(context.Background(), "%d parallel tests passed", total)
+	if failed == 0 {
+		log.Infof(context.Background(), "%d parallel tests passed", total)
+	} else {
+		log.Infof(context.Background(), "%d out of %d parallel tests failed", failed, total)
+	}
 }

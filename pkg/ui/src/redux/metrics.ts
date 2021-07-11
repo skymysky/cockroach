@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 /**
  * This module maintains the state of CockroachDB time series queries needed by
  * the web application. Cached query data is maintained separately for
@@ -6,9 +16,11 @@
  */
 
 import _ from "lodash";
-import { Action, Dispatch } from "redux";
+import { Action } from "redux";
+import { delay } from "redux-saga/effects";
+import { take, fork, call, all, put } from "redux-saga/effects";
 
-import * as protos from  "src/js/protos";
+import * as protos from "src/js/protos";
 import { PayloadAction } from "src/interfaces/action";
 import { queryTimeSeries } from "src/util/api";
 
@@ -16,6 +28,7 @@ type TSRequest = protos.cockroach.ts.tspb.TimeSeriesQueryRequest;
 type TSResponse = protos.cockroach.ts.tspb.TimeSeriesQueryResponse;
 
 export const REQUEST = "cockroachui/metrics/REQUEST";
+export const BEGIN = "cockroachui/metrics/BEGIN";
 export const RECEIVE = "cockroachui/metrics/RECEIVE";
 export const ERROR = "cockroachui/metrics/ERROR";
 export const FETCH = "cockroachui/metrics/FETCH";
@@ -25,7 +38,7 @@ export const FETCH_COMPLETE = "cockroachui/metrics/FETCH_COMPLETE";
  * WithID is a convenient interface for associating arbitrary data structures
  * with a component ID.
  */
-interface WithID<T> {
+export interface WithID<T> {
   id: string;
   data: T;
 }
@@ -33,7 +46,7 @@ interface WithID<T> {
 /**
  * A request/response pair.
  */
-interface RequestWithResponse {
+export interface RequestWithResponse {
   request: TSRequest;
   response: TSResponse;
 }
@@ -70,15 +83,17 @@ export class MetricsQuery {
 function metricsQueryReducer(state: MetricsQuery, action: Action) {
   switch (action.type) {
     // This component has requested a new set of metrics from the server.
-    case REQUEST:
+    case REQUEST: {
       const { payload: request } = action as PayloadAction<WithID<TSRequest>>;
       state = _.clone(state);
       state.nextRequest = request.data;
       return state;
-
+    }
     // Results for a previous request have been received from the server.
-    case RECEIVE:
-      const { payload: response } = action as PayloadAction<WithID<RequestWithResponse>>;
+    case RECEIVE: {
+      const { payload: response } = action as PayloadAction<
+        WithID<RequestWithResponse>
+      >;
       if (response.data.request === state.nextRequest) {
         state = _.clone(state);
         state.data = response.data.response;
@@ -86,14 +101,14 @@ function metricsQueryReducer(state: MetricsQuery, action: Action) {
         state.error = undefined;
       }
       return state;
-
+    }
     // The previous query for metrics for this component encountered an error.
-    case ERROR:
+    case ERROR: {
       const { payload: error } = action as PayloadAction<WithID<Error>>;
       state = _.clone(state);
       state.error = error.data;
       return state;
-
+    }
     default:
       return state;
   }
@@ -111,28 +126,34 @@ interface MetricQuerySet {
  * metricsQueriesReducer dispatches actions to the correct MetricsQuery, based
  * on the ID of the actions.
  */
-export function metricQuerySetReducer(state: MetricQuerySet = {}, action: Action) {
+export function metricQuerySetReducer(
+  state: MetricQuerySet = {},
+  action: Action,
+) {
   switch (action.type) {
     case REQUEST:
     case RECEIVE:
-    case ERROR:
+    case ERROR: {
       // All of these requests should be dispatched to a MetricQuery in the
       // collection. If a MetricQuery with that ID does not yet exist, create it.
       const { id } = (action as PayloadAction<WithID<any>>).payload;
       state = _.clone(state);
-      state[id] = metricsQueryReducer(state[id] || new MetricsQuery(id), action);
+      state[id] = metricsQueryReducer(
+        state[id] || new MetricsQuery(id),
+        action,
+      );
       return state;
-
+    }
     default:
       return state;
   }
 }
 
 /**
- * MetricQueryState maintains a MetricQuerySet collection, along with some
+ * MetricsState maintains a MetricQuerySet collection, along with some
  * metadata relevant to server queries.
  */
-export class MetricQueryState {
+export class MetricsState {
   // A count of the number of in-flight fetch requests.
   inFlight = 0;
   // The collection of MetricQuery objects.
@@ -144,7 +165,10 @@ export class MetricQueryState {
  * dispatching them based on ID. It also accepts actions which indicate the
  * state of the connection to the server.
  */
-export default function reducer(state: MetricQueryState = new MetricQueryState(), action: Action): MetricQueryState {
+export function metricsReducer(
+  state: MetricsState = new MetricsState(),
+  action: Action,
+): MetricsState {
   switch (action.type) {
     // A new fetch request to the server is now in flight.
     case FETCH:
@@ -170,9 +194,29 @@ export default function reducer(state: MetricQueryState = new MetricQueryState()
  * requestMetrics indicates that a component is requesting new data from the
  * server.
  */
-export function requestMetrics(id: string, request: TSRequest): PayloadAction<WithID<TSRequest>> {
+export function requestMetrics(
+  id: string,
+  request: TSRequest,
+): PayloadAction<WithID<TSRequest>> {
   return {
     type: REQUEST,
+    payload: {
+      id: id,
+      data: request,
+    },
+  };
+}
+
+/**
+ * beginMetrics is dispatched by the processing saga to indicate that it has
+ * begun the process of dispatching a request.
+ */
+export function beginMetrics(
+  id: string,
+  request: TSRequest,
+): PayloadAction<WithID<TSRequest>> {
+  return {
+    type: BEGIN,
     payload: {
       id: id,
       data: request,
@@ -205,7 +249,10 @@ export function receiveMetrics(
  * errorMetrics indicates that a previous request from this component could not
  * be fulfilled due to an error.
  */
-export function errorMetrics(id: string, error: Error): PayloadAction<WithID<Error>> {
+export function errorMetrics(
+  id: string,
+  error: Error,
+): PayloadAction<WithID<Error>> {
   return {
     type: ERROR,
     payload: {
@@ -235,103 +282,100 @@ export function fetchMetricsComplete(): Action {
 }
 
 /**
- * queuedRequests is a list of requests that should be asynchronously sent to
- * the server. As a purely asynchronous concept, this lives outside of the redux
- * store.
- */
-let queuedRequests: WithID<TSRequest>[] = [];
-
-/**
- * queuePromise is a promise that will be resolved when the current batch of
- * queued requests has been been processed. This is returned by the queryMetrics
- * thunk method, for use in synchronizing in tests.
- */
-let queuePromise: Promise<void> = null;
-
-/**
- * queryMetrics action allows components to asynchronously request new metrics
- * from the server. Components provide their id and a request object for new
- * data.
+ * queryMetricsSaga is a redux saga which listens for REQUEST actions and sends
+ * those requests to the server asynchronously.
  *
- * Requests to queryMetrics may be batched when dispatching to the server;
+ * Metric queries can be batched when sending to the to the server -
  * specifically, queries which have the same time span can be handled by the
- * server in a single call.
+ * server in a single call. This saga will attempt to batch any requests which
+ * are dispatched as part of the same event (e.g. if a rendering page displays
+ * several graphs which need data).
  */
-export function queryMetrics<S>(id: string, query: TSRequest) {
-  return (dispatch: Dispatch<S>): Promise<void> => {
-    // Indicate that this request has been received and queued.
-    dispatch(requestMetrics(id, query));
-    queuedRequests.push({
-      id: id,
-      data: query,
-    });
+export function* queryMetricsSaga() {
+  let requests: WithID<TSRequest>[] = [];
 
-    // Only the first queued request is responsible for initiating the fetch
-    // process. The fetch process is "debounced" with a setTimeout, and thus
-    // multiple queryMetrics actions can be batched into a single fetch from the
-    // server.
-    if (queuedRequests.length > 1) {
-      // Return queuePromise, created by an earlier queueMetrics request.
-      return queuePromise;
+  while (true) {
+    const requestAction: PayloadAction<WithID<TSRequest>> = yield take(REQUEST);
+
+    // Dispatch action to underlying store.
+    yield put(
+      beginMetrics(requestAction.payload.id, requestAction.payload.data),
+    );
+    requests.push(requestAction.payload);
+
+    // If no other requests are queued, fork a process which will send the
+    // request (and any other subsequent requests that are queued).
+    if (requests.length === 1) {
+      yield fork(sendRequestsAfterDelay);
     }
+  }
 
-    queuePromise = new Promise<void>((resolve, _reject) => {
-      setTimeout(() => {
-        // Increment in-flight counter.
-        dispatch(fetchMetrics());
+  function* sendRequestsAfterDelay() {
+    // Delay of zero will defer execution to the message queue, allowing the
+    // currently executing event (e.g. rendering a new page or a timespan change)
+    // to dispatch additional requests which can be batched.
+    yield delay(0);
 
-        // Construct queryable batches from the set of queued queries. Queries can
-        // be dispatched in a batch if they are querying over the same timespan.
-        const batches = _.groupBy(queuedRequests, (qr) => timespanKey(qr.data));
-        queuedRequests = [];
+    const requestsToSend = requests;
+    requests = [];
+    yield call(batchAndSendRequests, requestsToSend);
+  }
+}
 
-        // Fetch data from the server for each batch.
-        const promises = _.map(batches, (batch) => {
-          // Flatten the individual queries from all requests in the batch into a
-          // single request.
-          // Lodash operations are split into two methods because the lodash
-          // typescript definition loses type information when chaining into
-          // flatten.
-          const unifiedRequest = _.clone(batch[0].data);
-          const toFlatten = _.map(batch, (req) => req.data.queries);
-          unifiedRequest.queries = _.flatten(toFlatten);
+/**
+ * batchAndSendRequests attempts to send the supplied requests in the
+ * smallest number of batches possible.
+ */
+export function* batchAndSendRequests(requests: WithID<TSRequest>[]) {
+  // Construct queryable batches from the set of queued queries. Queries can
+  // be dispatched in a batch if they are querying over the same timespan.
+  const batches = _.groupBy(requests, (qr) => timespanKey(qr.data));
+  requests = [];
 
-          return queryTimeSeries(unifiedRequest).then((response) => {
-            // The number of results should match the queries exactly, and should
-            // be in the exact order passed.
-            if (response.results.length !== unifiedRequest.queries.length) {
-              throw `mismatched count of results (${response.results.length}) and queries (${unifiedRequest.queries.length})`;
-            }
+  yield put(fetchMetrics());
+  yield all(_.map(batches, (batch) => call(sendRequestBatch, batch)));
+  yield put(fetchMetricsComplete());
+}
 
-            const results = response.results;
+/**
+ * sendRequestBatch sends the supplied requests in a single batch.
+ */
+export function* sendRequestBatch(requests: WithID<TSRequest>[]) {
+  // Flatten the queries from the batch into a single request.
+  const unifiedRequest = _.clone(requests[0].data);
+  unifiedRequest.queries = _.flatMap(requests, (req) => req.data.queries);
 
-            // Match each result in the response to its corresponding original
-            // query. Each request may have sent multiple queries in the batch.
-            _.each(batch, (request) => {
-              const numQueries = request.data.queries.length;
-              dispatch(receiveMetrics(request.id, request.data, new protos.cockroach.ts.tspb.TimeSeriesQueryResponse({
-                results: results.splice(0, numQueries),
-              })));
-            });
-          }).catch((e: Error) => {
-            // Dispatch the error to each individual MetricsQuery which was
-            // requesting data.
-            _.each(batch, (request) => {
-              dispatch(errorMetrics(request.id, e));
-            });
-          });
-        });
+  let response: protos.cockroach.ts.tspb.TimeSeriesQueryResponse;
+  try {
+    response = yield call(queryTimeSeries, unifiedRequest);
+    // The number of results should match the queries exactly, and should
+    // be in the exact order passed.
+    if (response.results.length !== unifiedRequest.queries.length) {
+      throw `mismatched count of results (${response.results.length}) and queries (${unifiedRequest.queries.length})`;
+    }
+  } catch (e) {
+    // Dispatch the error to each individual MetricsQuery which was
+    // requesting data.
+    for (const request of requests) {
+      yield put(errorMetrics(request.id, e));
+    }
+    return;
+  }
 
-        // Wait for all promises to complete, then decrement in-flight counter
-        // and resolve queuePromise.
-        resolve(Promise.all(promises).then(() => {
-          dispatch(fetchMetricsComplete());
-        }));
-      });
-    });
-
-    return queuePromise;
-  };
+  // Match each result in the unified response to its corresponding original
+  // query. Each request may have sent multiple queries in the batch.
+  const results = response.results;
+  for (const request of requests) {
+    yield put(
+      receiveMetrics(
+        request.id,
+        request.data,
+        new protos.cockroach.ts.tspb.TimeSeriesQueryResponse({
+          results: results.splice(0, request.data.queries.length),
+        }),
+      ),
+    );
+  }
 }
 
 interface SimpleTimespan {
@@ -340,5 +384,9 @@ interface SimpleTimespan {
 }
 
 function timespanKey(timewindow: SimpleTimespan): string {
-  return (timewindow.start_nanos && timewindow.start_nanos.toString()) + ":" + (timewindow.end_nanos && timewindow.end_nanos.toString());
+  return (
+    (timewindow.start_nanos && timewindow.start_nanos.toString()) +
+    ":" +
+    (timewindow.end_nanos && timewindow.end_nanos.toString())
+  );
 }

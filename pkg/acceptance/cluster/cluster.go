@@ -1,29 +1,22 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cluster
 
 import (
+	"context"
+	gosql "database/sql"
 	"net"
 	"testing"
 
-	"golang.org/x/net/context"
-
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/errors"
 )
 
 // A Cluster is an abstraction away from a concrete cluster deployment (i.e.
@@ -32,8 +25,8 @@ import (
 type Cluster interface {
 	// NumNodes returns the number of nodes in the cluster, running or not.
 	NumNodes() int
-	// NewClient returns a kv client for the given node.
-	NewClient(context.Context, int) (*client.DB, error)
+	// NewDB returns a sql.DB client for the given node.
+	NewDB(context.Context, int) (*gosql.DB, error)
 	// PGUrl returns a URL string for the given node postgres server.
 	PGUrl(context.Context, int) string
 	// InternalIP returns the address used for inter-node communication.
@@ -45,8 +38,11 @@ type Cluster interface {
 	// AssertAndStop performs the same test as Assert but then proceeds to
 	// dismantle the cluster.
 	AssertAndStop(context.Context, testing.TB)
-	// ExecRoot executes the given command with super-user privileges.
-	ExecRoot(ctx context.Context, i int, cmd []string) error
+	// ExecCLI runs `./cockroach <args>`, while filling in required flags such as
+	// --insecure, --certs-dir, --host.
+	//
+	// Returns stdout, stderr, and an error.
+	ExecCLI(ctx context.Context, i int, args []string) (string, string, error)
 	// Kill terminates the cockroach process running on the given node number.
 	// The given integer must be in the range [0,NumNodes()-1].
 	Kill(context.Context, int) error
@@ -66,16 +62,5 @@ type Cluster interface {
 // in the cluster. It depends on a majority of the nodes being up, and does
 // the check against the node at index i.
 func Consistent(ctx context.Context, c Cluster, i int) error {
-	kvClient, err := c.NewClient(ctx, i)
-	if err != nil {
-		return err
-	}
-	// Set withDiff to false because any failure results in a second consistency check
-	// being called with withDiff=true.
-	return kvClient.CheckConsistency(
-		ctx,
-		keys.LocalMax,
-		keys.MaxKey,
-		false, /* withDiff*/
-	)
+	return errors.Errorf("Consistency checking is unimplmented and should be re-implemented using SQL")
 }

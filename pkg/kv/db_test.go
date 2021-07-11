@@ -1,397 +1,608 @@
-// Copyright 2014 The Cockroach Authors.
+// Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package kv_test
 
 import (
 	"bytes"
-	"errors"
-	"fmt"
-	"sync/atomic"
+	"context"
 	"testing"
-
-	"golang.org/x/net/context"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
-	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/kvclientutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
-func createTestClient(t *testing.T, s serverutils.TestServerInterface) *client.DB {
-	return createTestClientForUser(t, s, security.NodeUser)
+func setup(t *testing.T) (serverutils.TestServerInterface, *kv.DB) {
+	s, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	return s, kvDB
 }
 
-func createTestClientForUser(
-	t *testing.T, s serverutils.TestServerInterface, user string,
-) *client.DB {
-	var ctx base.Config
-	ctx.InitDefaults()
-	ctx.User = user
-	testutils.FillCerts(&ctx)
+func checkIntResult(t *testing.T, expected, result int64) {
+	if expected != result {
+		t.Errorf("expected %d, got %d", expected, result)
+	}
+}
 
-	conn, err := rpc.NewContext(log.AmbientContext{}, &ctx, s.Clock(), s.Stopper()).GRPCDial(s.ServingAddr())
+func checkResult(t *testing.T, expected, result []byte) {
+	if !bytes.Equal(expected, result) {
+		t.Errorf("expected \"%s\", got \"%s\"", expected, result)
+	}
+}
+
+func checkResults(t *testing.T, expected map[string][]byte, results []kv.Result) {
+	count := 0
+	for _, result := range results {
+		checkRows(t, expected, result.Rows)
+		count++
+	}
+	checkLen(t, len(expected), count)
+}
+
+func checkRows(t *testing.T, expected map[string][]byte, rows []kv.KeyValue) {
+	for i, row := range rows {
+		if !bytes.Equal(expected[string(row.Key)], row.ValueBytes()) {
+			t.Errorf("expected %d: %s=\"%s\", got %s=\"%s\"",
+				i,
+				row.Key,
+				expected[string(row.Key)],
+				row.Key,
+				row.ValueBytes())
+		}
+	}
+}
+
+func checkLen(t *testing.T, expected, count int) {
+	if expected != count {
+		t.Errorf("expected length to be %d, got %d", expected, count)
+	}
+}
+
+func TestDB_Get(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, db := setup(t)
+	defer s.Stopper().Stop(context.Background())
+
+	result, err := db.Get(context.Background(), "aa")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return client.NewDB(client.NewSender(conn), s.Clock())
+	checkResult(t, []byte(""), result.ValueBytes())
 }
 
-// TestKVDBCoverage verifies that all methods may be invoked on the
-// key value database.
-func TestKVDBCoverage(t *testing.T) {
+func TestDB_GetForUpdate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
-	ctx := context.TODO()
+	defer log.Scope(t).Close(t)
+	s, db := setup(t)
+	defer s.Stopper().Stop(context.Background())
 
-	db := createTestClient(t, s)
-	key := roachpb.Key("a")
-	value1 := []byte("value1")
-	value2 := []byte("value2")
-	value3 := []byte("value3")
-
-	// Put first value at key.
-	if pErr := db.Put(context.TODO(), key, value1); pErr != nil {
-		t.Fatal(pErr)
+	result, err := db.GetForUpdate(context.Background(), "aa")
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	// Verify put.
-	if gr, pErr := db.Get(ctx, key); pErr != nil {
-		t.Fatal(pErr)
-	} else if !gr.Exists() {
-		t.Error("expected key to exist")
-	}
-
-	// Conditional put should succeed, changing value1 to value2.
-	if pErr := db.CPut(context.TODO(), key, value2, value1); pErr != nil {
-		t.Fatal(pErr)
-	}
-
-	// Verify get by looking up conditional put value.
-	if gr, pErr := db.Get(ctx, key); pErr != nil {
-		t.Fatal(pErr)
-	} else if !bytes.Equal(gr.ValueBytes(), value2) {
-		t.Errorf("expected get to return %q; got %q", value2, gr.ValueBytes())
-	}
-
-	// Increment.
-	if ir, pErr := db.Inc(ctx, "i", 10); pErr != nil {
-		t.Fatal(pErr)
-	} else if ir.ValueInt() != 10 {
-		t.Errorf("expected increment new value of %d; got %d", 10, ir.ValueInt())
-	}
-
-	// Delete conditional put value.
-	if pErr := db.Del(ctx, key); pErr != nil {
-		t.Fatal(pErr)
-	}
-	if gr, pErr := db.Get(ctx, key); pErr != nil {
-		t.Fatal(pErr)
-	} else if gr.Exists() {
-		t.Error("expected key to not exist after delete")
-	}
-
-	// Put values in anticipation of scan & delete range.
-	keyValues := []roachpb.KeyValue{
-		{Key: roachpb.Key("a"), Value: roachpb.MakeValueFromBytes(value1)},
-		{Key: roachpb.Key("b"), Value: roachpb.MakeValueFromBytes(value2)},
-		{Key: roachpb.Key("c"), Value: roachpb.MakeValueFromBytes(value3)},
-	}
-	for _, kv := range keyValues {
-		valueBytes, pErr := kv.Value.GetBytes()
-		if pErr != nil {
-			t.Fatal(pErr)
-		}
-		if pErr := db.Put(context.TODO(), kv.Key, valueBytes); pErr != nil {
-			t.Fatal(pErr)
-		}
-	}
-	if rows, pErr := db.Scan(context.TODO(), "a", "d", 0); pErr != nil {
-		t.Fatal(pErr)
-	} else if len(rows) != len(keyValues) {
-		t.Fatalf("expected %d rows in scan; got %d", len(keyValues), len(rows))
-	} else {
-		for i, kv := range keyValues {
-			valueBytes, pErr := kv.Value.GetBytes()
-			if pErr != nil {
-				t.Fatal(pErr)
-			}
-			if !bytes.Equal(rows[i].ValueBytes(), valueBytes) {
-				t.Errorf("%d: key %q, values %q != %q", i, kv.Key, rows[i].ValueBytes(), valueBytes)
-			}
-		}
-	}
-
-	// Test reverse scan.
-	if rows, pErr := db.ReverseScan(context.TODO(), "a", "d", 0); pErr != nil {
-		t.Fatal(pErr)
-	} else if len(rows) != len(keyValues) {
-		t.Fatalf("expected %d rows in scan; got %d", len(keyValues), len(rows))
-	} else {
-		for i, kv := range keyValues {
-			valueBytes, pErr := kv.Value.GetBytes()
-			if pErr != nil {
-				t.Fatal(pErr)
-			}
-			if !bytes.Equal(rows[len(keyValues)-1-i].ValueBytes(), valueBytes) {
-				t.Errorf("%d: key %q, values %q != %q", i, kv.Key, rows[len(keyValues)-i].ValueBytes(), valueBytes)
-			}
-		}
-	}
-
-	if pErr := db.DelRange(context.TODO(), "a", "c"); pErr != nil {
-		t.Fatal(pErr)
-	}
+	checkResult(t, []byte(""), result.ValueBytes())
 }
 
-func TestKVDBInternalMethods(t *testing.T) {
+func TestDB_Put(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer log.Scope(t).Close(t)
+	s, db := setup(t)
+	defer s.Stopper().Stop(context.Background())
+	ctx := context.Background()
 
-	testCases := []roachpb.Request{
-		&roachpb.HeartbeatTxnRequest{},
-		&roachpb.GCRequest{},
-		&roachpb.PushTxnRequest{},
-		&roachpb.QueryTxnRequest{},
-		&roachpb.ResolveIntentRequest{},
-		&roachpb.ResolveIntentRangeRequest{},
-		&roachpb.MergeRequest{},
-		&roachpb.TruncateLogRequest{},
-		&roachpb.RequestLeaseRequest{},
-
-		&roachpb.EndTransactionRequest{
-			InternalCommitTrigger: &roachpb.InternalCommitTrigger{},
-		},
+	if err := db.Put(context.Background(), "aa", "1"); err != nil {
+		t.Fatal(err)
 	}
-	// Verify internal methods experience bad request errors.
-	db := createTestClient(t, s)
-	for i, args := range testCases {
-		{
-			header := args.Header()
-			header.Key = roachpb.Key("a")
-			args.SetHeader(header)
-		}
-		if roachpb.IsRange(args) {
-			header := args.Header()
-			header.EndKey = args.Header().Key.Next()
-			args.SetHeader(header)
-		}
-		b := &client.Batch{}
-		b.AddRawRequest(args)
-		err := db.Run(context.TODO(), b)
-		if !testutils.IsError(err, "contains an internal request|contains commit trigger") {
-			t.Errorf("%d: unexpected error for %s: %v", i, args.Method(), err)
-		}
+	result, err := db.Get(ctx, "aa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkResult(t, []byte("1"), result.ValueBytes())
+}
+
+func TestDB_CPut(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, db := setup(t)
+	defer s.Stopper().Stop(context.Background())
+	ctx := context.Background()
+
+	if err := db.Put(ctx, "aa", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CPut(ctx, "aa", "2", kvclientutils.StrToCPutExistingValue("1")); err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.Get(ctx, "aa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkResult(t, []byte("2"), result.ValueBytes())
+
+	if err = db.CPut(ctx, "aa", "3", kvclientutils.StrToCPutExistingValue("1")); err == nil {
+		t.Fatal("expected error from conditional put")
+	}
+	result, err = db.Get(ctx, "aa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkResult(t, []byte("2"), result.ValueBytes())
+
+	if err = db.CPut(ctx, "bb", "4", kvclientutils.StrToCPutExistingValue("1")); err == nil {
+		t.Fatal("expected error from conditional put")
+	}
+	result, err = db.Get(ctx, "bb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkResult(t, []byte(""), result.ValueBytes())
+
+	if err = db.CPut(ctx, "bb", "4", nil); err != nil {
+		t.Fatal(err)
+	}
+	result, err = db.Get(ctx, "bb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkResult(t, []byte("4"), result.ValueBytes())
+}
+
+func TestDB_CPutInline(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, db := setup(t)
+	defer s.Stopper().Stop(context.Background())
+	ctx := kv.CtxForCPutInline(context.Background())
+
+	if err := db.PutInline(ctx, "aa", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CPutInline(ctx, "aa", "2", kvclientutils.StrToCPutExistingValue("1")); err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.Get(ctx, "aa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkResult(t, []byte("2"), result.ValueBytes())
+
+	if err = db.CPutInline(ctx, "aa", "3", kvclientutils.StrToCPutExistingValue("1")); err == nil {
+		t.Fatal("expected error from conditional put")
+	}
+	result, err = db.Get(ctx, "aa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkResult(t, []byte("2"), result.ValueBytes())
+
+	if err = db.CPutInline(ctx, "bb", "4", kvclientutils.StrToCPutExistingValue("1")); err == nil {
+		t.Fatal("expected error from conditional put")
+	}
+	result, err = db.Get(ctx, "bb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkResult(t, []byte(""), result.ValueBytes())
+
+	if err = db.CPutInline(ctx, "bb", "4", nil); err != nil {
+		t.Fatal(err)
+	}
+	result, err = db.Get(ctx, "bb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkResult(t, []byte("4"), result.ValueBytes())
+
+	if err = db.CPutInline(ctx, "aa", nil, kvclientutils.StrToCPutExistingValue("2")); err != nil {
+		t.Fatal(err)
+	}
+	result, err = db.Get(ctx, "aa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Value != nil {
+		t.Fatalf("expected deleted value, got %x", result.ValueBytes())
 	}
 }
 
-// TestKVDBTransaction verifies that transactions work properly over
-// the KV DB endpoint.
-func TestKVDBTransaction(t *testing.T) {
+func TestDB_InitPut(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer log.Scope(t).Close(t)
+	s, db := setup(t)
+	defer s.Stopper().Stop(context.Background())
+	ctx := context.Background()
 
-	db := createTestClient(t, s)
+	if err := db.InitPut(ctx, "aa", "1", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InitPut(ctx, "aa", "1", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InitPut(ctx, "aa", "2", false); err == nil {
+		t.Fatal("expected error from init put")
+	}
+	if err := db.Del(ctx, "aa"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InitPut(ctx, "aa", "2", true); err == nil {
+		t.Fatal("expected error from init put")
+	}
+	if err := db.InitPut(ctx, "aa", "1", false); err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.Get(ctx, "aa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkResult(t, []byte("1"), result.ValueBytes())
+}
 
-	key := roachpb.Key("db-txn-test")
-	value := []byte("value")
-	err := db.Txn(context.TODO(), func(ctx context.Context, txn *client.Txn) error {
-		// Use snapshot isolation so non-transactional read can always push.
-		if err := txn.SetIsolation(enginepb.SNAPSHOT); err != nil {
-			return err
-		}
+func TestDB_Inc(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, db := setup(t)
+	defer s.Stopper().Stop(context.Background())
+	ctx := context.Background()
 
-		if err := txn.Put(ctx, key, value); err != nil {
+	if _, err := db.Inc(ctx, "aa", 100); err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.Get(ctx, "aa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkIntResult(t, 100, result.ValueInt())
+}
+
+func TestBatch(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, db := setup(t)
+	defer s.Stopper().Stop(context.Background())
+
+	b := &kv.Batch{}
+	b.Get("aa")
+	b.Put("bb", "2")
+	if err := db.Run(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+
+	expected := map[string][]byte{
+		"aa": []byte(""),
+		"bb": []byte("2"),
+	}
+	checkResults(t, expected, b.Results)
+}
+
+func TestDB_Scan(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, db := setup(t)
+	defer s.Stopper().Stop(context.Background())
+
+	b := &kv.Batch{}
+	b.Put("aa", "1")
+	b.Put("ab", "2")
+	b.Put("bb", "3")
+	if err := db.Run(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.Scan(context.Background(), "a", "b", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := map[string][]byte{
+		"aa": []byte("1"),
+		"ab": []byte("2"),
+	}
+
+	checkRows(t, expected, rows)
+	checkLen(t, len(expected), len(rows))
+}
+
+func TestDB_ScanForUpdate(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, db := setup(t)
+	defer s.Stopper().Stop(context.Background())
+
+	b := &kv.Batch{}
+	b.Put("aa", "1")
+	b.Put("ab", "2")
+	b.Put("bb", "3")
+	if err := db.Run(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.ScanForUpdate(context.Background(), "a", "b", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := map[string][]byte{
+		"aa": []byte("1"),
+		"ab": []byte("2"),
+	}
+
+	checkRows(t, expected, rows)
+	checkLen(t, len(expected), len(rows))
+}
+
+func TestDB_ReverseScan(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, db := setup(t)
+	defer s.Stopper().Stop(context.Background())
+
+	b := &kv.Batch{}
+	b.Put("aa", "1")
+	b.Put("ab", "2")
+	b.Put("bb", "3")
+	if err := db.Run(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.ReverseScan(context.Background(), "ab", "c", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := map[string][]byte{
+		"bb": []byte("3"),
+		"ab": []byte("2"),
+	}
+
+	checkRows(t, expected, rows)
+	checkLen(t, len(expected), len(rows))
+}
+
+func TestDB_ReverseScanForUpdate(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, db := setup(t)
+	defer s.Stopper().Stop(context.Background())
+
+	b := &kv.Batch{}
+	b.Put("aa", "1")
+	b.Put("ab", "2")
+	b.Put("bb", "3")
+	if err := db.Run(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.ReverseScanForUpdate(context.Background(), "ab", "c", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := map[string][]byte{
+		"bb": []byte("3"),
+		"ab": []byte("2"),
+	}
+
+	checkRows(t, expected, rows)
+	checkLen(t, len(expected), len(rows))
+}
+
+func TestDB_TxnIterate(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, db := setup(t)
+	defer s.Stopper().Stop(context.Background())
+
+	b := &kv.Batch{}
+	b.Put("aa", "1")
+	b.Put("ab", "2")
+	b.Put("bb", "3")
+	if err := db.Run(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+
+	tc := []struct{ pageSize, numPages int }{
+		{1, 2},
+		{2, 1},
+	}
+	var rows []kv.KeyValue = nil
+	var p int
+	for _, c := range tc {
+		if err := db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
+			p = 0
+			rows = make([]kv.KeyValue, 0)
+			return txn.Iterate(context.Background(), "a", "b", c.pageSize,
+				func(rs []kv.KeyValue) error {
+					p++
+					rows = append(rows, rs...)
+					return nil
+				})
+		}); err != nil {
 			t.Fatal(err)
 		}
-
-		// Attempt to read outside of txn.
-		if gr, err := db.Get(ctx, key); err != nil {
-			t.Fatal(err)
-		} else if gr.Exists() {
-			t.Errorf("expected nil value; got %+v", gr.Value)
+		expected := map[string][]byte{
+			"aa": []byte("1"),
+			"ab": []byte("2"),
 		}
 
-		// Read within the transaction.
-		if gr, err := txn.Get(ctx, key); err != nil {
-			t.Fatal(err)
-		} else if !gr.Exists() || !bytes.Equal(gr.ValueBytes(), value) {
-			t.Errorf("expected value %q; got %q", value, gr.ValueBytes())
+		checkRows(t, expected, rows)
+		checkLen(t, len(expected), len(rows))
+		if p != c.numPages {
+			t.Errorf("expected %d pages, got %d", c.numPages, p)
 		}
-		return nil
+	}
+}
+
+func TestDB_Del(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, db := setup(t)
+	defer s.Stopper().Stop(context.Background())
+
+	b := &kv.Batch{}
+	b.Put("aa", "1")
+	b.Put("ab", "2")
+	b.Put("ac", "3")
+	if err := db.Run(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Del(context.Background(), "ab"); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.Scan(context.Background(), "a", "b", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := map[string][]byte{
+		"aa": []byte("1"),
+		"ac": []byte("3"),
+	}
+	checkRows(t, expected, rows)
+	checkLen(t, len(expected), len(rows))
+}
+
+func TestTxn_Commit(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, db := setup(t)
+	defer s.Stopper().Stop(context.Background())
+
+	err := db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
+		b := txn.NewBatch()
+		b.Put("aa", "1")
+		b.Put("ab", "2")
+		return txn.CommitInBatch(ctx, b)
 	})
 	if err != nil {
-		t.Errorf("expected success on commit; got %s", err)
-	}
-
-	// Verify the value is now visible after commit.
-	if gr, err := db.Get(context.TODO(), key); err != nil {
-		t.Errorf("expected success reading value; got %s", err)
-	} else if !gr.Exists() || !bytes.Equal(gr.ValueBytes(), value) {
-		t.Errorf("expected value %q; got %q", value, gr.ValueBytes())
-	}
-}
-
-// TestAuthentication tests authentication for the KV endpoint.
-func TestAuthentication(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
-
-	b1 := &client.Batch{}
-	b1.Put("a", "b")
-
-	// Create a node user client and call Run() on it which lets us build our own
-	// request, specifying the user.
-	db1 := createTestClientForUser(t, s, security.NodeUser)
-	if err := db1.Run(context.TODO(), b1); err != nil {
 		t.Fatal(err)
 	}
 
-	b2 := &client.Batch{}
-	b2.Put("c", "d")
-
-	// Try again, but this time with certs for a non-node user (even the root
-	// user has no KV permissions).
-	db2 := createTestClientForUser(t, s, security.RootUser)
-	if err := db2.Run(context.TODO(), b2); !testutils.IsError(err, "is not allowed") {
+	b := &kv.Batch{}
+	b.Get("aa")
+	b.Get("ab")
+	if err := db.Run(context.Background(), b); err != nil {
 		t.Fatal(err)
 	}
+	expected := map[string][]byte{
+		"aa": []byte("1"),
+		"ab": []byte("2"),
+	}
+	checkResults(t, expected, b.Results)
 }
 
-// TestTxnDelRangeIntentResolutionCounts ensures that intents left behind by a
-// DelRange with a MaxSpanRequestKeys limit are resolved correctly and by
-// using the minimal span of keys.
-func TestTxnDelRangeIntentResolutionCounts(t *testing.T) {
+func TestDB_Put_insecure(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	var intentResolutionCount int64
-	params := base.TestServerArgs{
-		Knobs: base.TestingKnobs{
-			Store: &storage.StoreTestingKnobs{
-				NumKeysEvaluatedForRangeIntentResolution: &intentResolutionCount,
-				TestingEvalFilter: func(filterArgs storagebase.FilterArgs) *roachpb.Error {
-					req, ok := filterArgs.Req.(*roachpb.ResolveIntentRequest)
-					if ok {
-						key := req.Header().Key.String()
-						// Check if the intent is from the range being
-						// scanned below.
-						if key >= "a" && key < "d" {
-							t.Errorf("resolving intent on key %s", key)
-						}
-					}
-					return nil
-				},
-			},
-		},
+	defer log.Scope(t).Close(t)
+	s, _, db := serverutils.StartServer(t, base.TestServerArgs{Insecure: true})
+	defer s.Stopper().Stop(context.Background())
+	ctx := context.Background()
+
+	if err := db.Put(context.Background(), "aa", "1"); err != nil {
+		t.Fatal(err)
 	}
-	s, _, db := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
-
-	for _, abortTxn := range []bool{false, true} {
-		spanSize := int64(10)
-		prefixes := []string{"a", "b", "c"}
-		for i := int64(0); i < spanSize; i++ {
-			for _, prefix := range prefixes {
-				if err := db.Put(context.TODO(), fmt.Sprintf("%s%d", prefix, i), "v"); err != nil {
-					t.Fatal(err)
-				}
-			}
-		}
-		totalNumKeys := int64(len(prefixes)) * spanSize
-
-		atomic.StoreInt64(&intentResolutionCount, 0)
-		limit := totalNumKeys / 2
-		if err := db.Txn(context.TODO(), func(ctx context.Context, txn *client.Txn) error {
-			var b client.Batch
-			// Fully deleted.
-			b.DelRange("a", "b", false)
-			// Partially deleted.
-			b.DelRange("b", "c", false)
-			// Not deleted.
-			b.DelRange("c", "d", false)
-			b.Header.MaxSpanRequestKeys = limit
-			if err := txn.Run(ctx, &b); err != nil {
-				return err
-			}
-			if abortTxn {
-				return errors.New("aborting txn")
-			}
-			return nil
-		}); err != nil && !abortTxn {
-			t.Fatal(err)
-		}
-
-		// Ensure that the correct number of keys were evaluated for intents.
-		if numKeys := atomic.LoadInt64(&intentResolutionCount); numKeys != limit {
-			t.Fatalf("abortTxn: %v, resolved %d keys, expected %d", abortTxn, numKeys, limit)
-		}
-
-		// Ensure no intents are left behind. Scan the entire span to resolve
-		// any intents that were left behind; intents are resolved internally
-		// through ResolveIntentRequest(s).
-		kvs, err := db.Scan(context.TODO(), "a", "d", totalNumKeys)
-		if err != nil {
-			t.Fatal(err)
-		}
-		expectedNumKeys := totalNumKeys / 2
-		if abortTxn {
-			expectedNumKeys = totalNumKeys
-		}
-		if int64(len(kvs)) != expectedNumKeys {
-			t.Errorf("abortTxn: %v, %d keys left behind, expected=%d",
-				abortTxn, len(kvs), expectedNumKeys)
-		}
+	result, err := db.Get(ctx, "aa")
+	if err != nil {
+		t.Fatal(err)
 	}
+	checkResult(t, []byte("1"), result.ValueBytes())
 }
 
-// Test that, for non-transactional requests, low-level retryable errors get
-// transformed to an UnhandledRetryableError.
-func TestNonTransactionalRetryableError(t *testing.T) {
+// Test that all operations on a decommissioned node will return a
+// permission denied error rather than hanging indefinitely due to
+// internal retries.
+func TestDBDecommissionedOperations(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	key := []byte("key-restart")
-	value := []byte("value")
-	params := base.TestServerArgs{}
-	testingKnobs := &storage.StoreTestingKnobs{
-		TestingEvalFilter: func(args storagebase.FilterArgs) *roachpb.Error {
-			if resArgs, ok := args.Req.(*roachpb.PutRequest); ok {
-				if resArgs.Key.Equal(key) {
-					return roachpb.NewError(&roachpb.WriteTooOldError{})
-				}
-			}
-			return nil
-		},
+	ctx := context.Background()
+	tc := testcluster.StartTestCluster(t, 2, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual, // saves time
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	scratchKey := tc.ScratchRange(t)
+	scratchRange := tc.LookupRangeOrFatal(t, scratchKey)
+	require.Len(t, scratchRange.InternalReplicas, 1)
+	require.Equal(t, tc.Server(0).NodeID(), scratchRange.InternalReplicas[0].NodeID)
+
+	// Decommission server 1.
+	srv := tc.Server(0)
+	decomSrv := tc.Server(1)
+	for _, status := range []livenesspb.MembershipStatus{
+		livenesspb.MembershipStatus_DECOMMISSIONING, livenesspb.MembershipStatus_DECOMMISSIONED,
+	} {
+		require.NoError(t, srv.Decommission(ctx, status, []roachpb.NodeID{decomSrv.NodeID()}))
 	}
-	params.Knobs.Store = testingKnobs
-	s, _, db := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
 
-	err := db.Put(context.TODO(), key, value)
-	if _, ok := err.(*roachpb.UnhandledRetryableError); !ok {
-		t.Fatalf("expected UnhandledRetryableError, got: %T - %v", err, err)
+	// Run a few different operations, which should all eventually error with
+	// PermissionDenied. We don't need full coverage of methods, since they use
+	// the same sender infrastructure, but should use a few variations to hit
+	// different sender code paths (e.g. with and without txns).
+	db := decomSrv.DB()
+	key := roachpb.Key([]byte("a"))
+	keyEnd := roachpb.Key([]byte("x"))
+	value := []byte{1, 2, 3}
+
+	testcases := []struct {
+		name string
+		op   func() error
+	}{
+		{"Del", func() error {
+			return db.Del(ctx, key)
+		}},
+		{"DelRange", func() error {
+			return db.DelRange(ctx, key, keyEnd)
+		}},
+		{"Get", func() error {
+			_, err := db.Get(ctx, key)
+			return err
+		}},
+		{"GetForUpdate", func() error {
+			_, err := db.GetForUpdate(ctx, key)
+			return err
+		}},
+		{"Put", func() error {
+			return db.Put(ctx, key, value)
+		}},
+		{"Scan", func() error {
+			_, err := db.Scan(ctx, key, keyEnd, 0)
+			return err
+		}},
+		{"TxnGet", func() error {
+			_, err := db.NewTxn(ctx, "").Get(ctx, key)
+			return err
+		}},
+		{"TxnPut", func() error {
+			return db.NewTxn(ctx, "").Put(ctx, key, value)
+		}},
+		{"AdminTransferLease", func() error {
+			return db.AdminTransferLease(ctx, scratchKey, srv.GetFirstStoreID())
+		}},
+	}
+
+	for _, tc := range testcases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			var err error
+			require.Eventually(t, func() bool {
+				err = tc.op()
+				s, ok := status.FromError(errors.UnwrapAll(err))
+				if s == nil || !ok {
+					return false
+				}
+				require.Equal(t, codes.PermissionDenied, s.Code())
+				return true
+			}, 10*time.Second, 100*time.Millisecond, "timed out waiting for gRPC error, got %v", err)
+		})
 	}
 }

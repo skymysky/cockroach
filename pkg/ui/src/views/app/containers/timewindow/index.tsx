@@ -1,9 +1,20 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import React from "react";
 import { connect } from "react-redux";
 import moment from "moment";
 
 import { AdminUIState } from "src/redux/state";
 import * as timewindow from "src/redux/timewindow";
+import _ from "lodash";
 
 interface TimeWindowManagerProps {
   // The current timewindow redux state.
@@ -25,7 +36,10 @@ interface TimeWindowManagerState {
  * updated time window into the redux store whenever the previous time window is
  * expired.
  */
-class TimeWindowManager extends React.Component<TimeWindowManagerProps, TimeWindowManagerState> {
+class TimeWindowManager extends React.Component<
+  TimeWindowManagerProps,
+  TimeWindowManagerState
+> {
   constructor(props?: TimeWindowManagerProps, context?: any) {
     super(props, context);
     this.state = { timeout: null };
@@ -60,12 +74,15 @@ class TimeWindowManager extends React.Component<TimeWindowManagerProps, TimeWind
     const now = props.now ? props.now() : moment();
     const currentEnd = props.timeWindow.currentWindow.end;
     const expires = currentEnd.clone().add(props.timeWindow.scale.windowValid);
-    if (now.isAfter(expires))  {
+    if (now.isAfter(expires)) {
       // Current time window is expired, reset it.
       this.setWindow(props);
     } else {
       // Set a timeout to reset the window when the current window expires.
-      const newTimeout = setTimeout(() => this.setWindow(props), expires.diff(now).valueOf());
+      const newTimeout = window.setTimeout(
+        () => this.setWindow(props),
+        expires.diff(now).valueOf(),
+      );
       this.setState({
         timeout: newTimeout,
       });
@@ -78,11 +95,13 @@ class TimeWindowManager extends React.Component<TimeWindowManagerProps, TimeWind
    */
   setWindow(props: TimeWindowManagerProps) {
     if (!props.timeWindow.scale.windowEnd) {
-      const now = props.now ? props.now() : moment();
-      props.setTimeWindow({
-        start: now.clone().subtract(props.timeWindow.scale.windowSize),
-        end: now,
-      });
+      if (!props.timeWindow.useTimeRange) {
+        const now = props.now ? props.now() : moment();
+        props.setTimeWindow({
+          start: now.clone().subtract(props.timeWindow.scale.windowSize),
+          end: now,
+        });
+      }
     } else {
       const windowEnd = props.timeWindow.scale.windowEnd;
       props.setTimeWindow({
@@ -92,12 +111,14 @@ class TimeWindowManager extends React.Component<TimeWindowManagerProps, TimeWind
     }
   }
 
-  componentWillMount() {
+  componentDidMount() {
     this.checkWindow(this.props);
   }
 
-  componentWillReceiveProps(props: TimeWindowManagerProps) {
-    this.checkWindow(props);
+  componentDidUpdate(prevProps: TimeWindowManagerProps) {
+    if (!_.isEqual(prevProps.timeWindow, this.props.timeWindow)) {
+      this.checkWindow(this.props);
+    }
   }
 
   render(): any {

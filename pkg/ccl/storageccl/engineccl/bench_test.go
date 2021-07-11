@@ -4,26 +4,29 @@
 // License (the "License"); you may not use this file except in compliance with
 // the License. You may obtain a copy of the License at
 //
-//     https://github.com/cockroachdb/cockroach/blob/master/LICENSE
+//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
 
 package engineccl
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"golang.org/x/net/context"
-
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/errors/oserror"
 )
 
 // loadTestData writes numKeys keys in numBatches separate batches. Keys are
@@ -42,20 +45,22 @@ import (
 // whether to use a temporary or permanent location.
 func loadTestData(
 	dir string, numKeys, numBatches, batchTimeSpan, valueBytes int,
-) (engine.Engine, error) {
+) (storage.Engine, error) {
 	ctx := context.Background()
 
 	exists := true
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
+	if _, err := os.Stat(dir); oserror.IsNotExist(err) {
 		exists = false
 	}
 
-	eng, err := engine.NewRocksDB(
-		roachpb.Attributes{},
-		dir,
-		engine.RocksDBCache{},
-		0,
-		engine.DefaultMaxOpenFiles,
+	eng, err := storage.NewPebble(
+		ctx,
+		storage.PebbleConfig{
+			StorageConfig: base.StorageConfig{
+				Settings: cluster.MakeTestingClusterSettings(),
+				Dir:      dir,
+			},
+		},
 	)
 	if err != nil {
 		return nil, err
@@ -81,13 +86,13 @@ func loadTestData(
 		sstTimestamps[i] = int64((i + 1) * batchTimeSpan)
 	}
 
-	var batch engine.Batch
+	var batch storage.Batch
 	var minWallTime int64
 	for i, key := range keys {
 		if scaled := len(keys) / numBatches; (i % scaled) == 0 {
 			if i > 0 {
 				log.Infof(ctx, "committing (%d/~%d)", i/scaled, numBatches)
-				if err := batch.Commit(false /* !sync */); err != nil {
+				if err := batch.Commit(false /* sync */); err != nil {
 					return nil, err
 				}
 				batch.Close()
@@ -101,11 +106,11 @@ func loadTestData(
 		timestamp := hlc.Timestamp{WallTime: minWallTime + rand.Int63n(int64(batchTimeSpan))}
 		value := roachpb.MakeValueFromBytes(randutil.RandBytes(rng, valueBytes))
 		value.InitChecksum(key)
-		if err := engine.MVCCPut(ctx, batch, nil, key, timestamp, value, nil); err != nil {
+		if err := storage.MVCCPut(ctx, batch, nil, key, timestamp, value, nil); err != nil {
 			return nil, err
 		}
 	}
-	if err := batch.Commit(false /* !sync */); err != nil {
+	if err := batch.Commit(false /* sync */); err != nil {
 		return nil, err
 	}
 	batch.Close()
@@ -122,7 +127,7 @@ func loadTestData(
 func runIterate(
 	b *testing.B,
 	loadFactor float32,
-	makeIterator func(engine.Engine, hlc.Timestamp, hlc.Timestamp) engine.Iterator,
+	makeIterator func(storage.Engine, hlc.Timestamp, hlc.Timestamp) storage.MVCCIterator,
 ) {
 	const numKeys = 100000
 	const numBatches = 100
@@ -144,9 +149,12 @@ func runIterate(
 		n := 0
 		startTime := hlc.MinTimestamp
 		endTime := hlc.Timestamp{WallTime: int64(loadFactor * numBatches * batchTimeSpan)}
+		if endTime.IsEmpty() {
+			endTime = endTime.Next()
+		}
 		it := makeIterator(eng, startTime, endTime)
 		defer it.Close()
-		for it.Seek(engine.MVCCKey{}); ; it.Next() {
+		for it.SeekGE(storage.MVCCKey{Key: keys.LocalMax}); ; it.Next() {
 			if ok, err := it.Valid(); !ok {
 				if err != nil {
 					b.Fatal(err)
@@ -165,15 +173,19 @@ func runIterate(
 
 func BenchmarkTimeBoundIterate(b *testing.B) {
 	for _, loadFactor := range []float32{1.0, 0.5, 0.1, 0.05, 0.0} {
-		b.Run(fmt.Sprintf("LoadFactor%.2f", loadFactor), func(b *testing.B) {
+		b.Run(fmt.Sprintf("LoadFactor=%.2f", loadFactor), func(b *testing.B) {
 			b.Run("NormalIterator", func(b *testing.B) {
-				runIterate(b, loadFactor, func(e engine.Engine, _, _ hlc.Timestamp) engine.Iterator {
-					return e.NewIterator(false)
+				runIterate(b, loadFactor, func(e storage.Engine, _, _ hlc.Timestamp) storage.MVCCIterator {
+					return e.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
 				})
 			})
 			b.Run("TimeBoundIterator", func(b *testing.B) {
-				runIterate(b, loadFactor, func(e engine.Engine, startTime, endTime hlc.Timestamp) engine.Iterator {
-					return e.NewTimeBoundIterator(startTime, endTime)
+				runIterate(b, loadFactor, func(e storage.Engine, startTime, endTime hlc.Timestamp) storage.MVCCIterator {
+					return e.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
+						MinTimestampHint: startTime,
+						MaxTimestampHint: endTime,
+						UpperBound:       roachpb.KeyMax,
+					})
 				})
 			})
 		})

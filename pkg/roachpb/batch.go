@@ -1,70 +1,111 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package roachpb
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"strings"
 
-	"github.com/pkg/errors"
-
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
-//go:generate go run -tags gen-batch gen_batch.go
+//go:generate go run -tags gen-batch gen/main.go
+
+// WriteTimestamp returns the timestamps at which this request is writing. For
+// non-transactional requests, this is the same as the read timestamp. For
+// transactional requests, the write timestamp can be higher until commit time.
+//
+// This should only be called after SetActiveTimestamp().
+func (h Header) WriteTimestamp() hlc.Timestamp {
+	ts := h.Timestamp
+	if h.Txn != nil {
+		ts.Forward(h.Txn.WriteTimestamp)
+	}
+	return ts
+}
 
 // SetActiveTimestamp sets the correct timestamp at which the request is to be
 // carried out. For transactional requests, ba.Timestamp must be zero initially
-// and it will be set to txn.OrigTimestamp. For non-transactional requests, if
-// no timestamp is specified, nowFn is used to create and set one.
+// and it will be set to txn.ReadTimestamp (note though this mostly impacts
+// reads; writes use txn.WriteTimestamp). For non-transactional requests, if no
+// timestamp is specified, nowFn is used to create and set one.
 func (ba *BatchRequest) SetActiveTimestamp(nowFn func() hlc.Timestamp) error {
 	if txn := ba.Txn; txn != nil {
-		if ba.Timestamp != (hlc.Timestamp{}) {
+		if !ba.Timestamp.IsEmpty() {
 			return errors.New("transactional request must not set batch timestamp")
 		}
 
-		// Always use the original timestamp for reads and writes, even
-		// though some intents may be written at higher timestamps in the
-		// event of a WriteTooOldError.
-		ba.Timestamp = txn.OrigTimestamp
+		// The batch timestamp is the timestamp at which reads are performed. We set
+		// this to the txn's read timestamp, even if the txn's provisional
+		// commit timestamp has been forwarded, so that all reads within a txn
+		// observe the same snapshot of the database regardless of how the
+		// provisional commit timestamp evolves.
+		//
+		// Note that writes will be performed at the provisional commit timestamp,
+		// txn.WriteTimestamp, regardless of the batch timestamp.
+		ba.Timestamp = txn.ReadTimestamp
 	} else {
 		// When not transactional, allow empty timestamp and use nowFn instead
-		if ba.Timestamp == (hlc.Timestamp{}) {
+		if ba.Timestamp.IsEmpty() {
 			ba.Timestamp = nowFn()
 		}
 	}
 	return nil
 }
 
+// EarliestActiveTimestamp returns the earliest timestamp at which the batch
+// would operate, which is nominally ba.Timestamp but could be earlier if a
+// request in the batch operates on a time span such as ExportRequest or
+// RevertRangeRequest, which both specify the start of that span in their
+// arguments while using ba.Timestamp to indicate the upper bound of that span.
+func (ba BatchRequest) EarliestActiveTimestamp() hlc.Timestamp {
+	ts := ba.Timestamp
+	for _, ru := range ba.Requests {
+		switch t := ru.GetInner().(type) {
+		case *ExportRequest:
+			if !t.StartTime.IsEmpty() {
+				ts.Backward(t.StartTime)
+			}
+		case *RevertRangeRequest:
+			// This method is only used to check GC Threshold so Revert requests that
+			// opt-out of checking the target vs threshold should skip this.
+			if !t.IgnoreGcThreshold {
+				ts.Backward(t.TargetTime)
+			}
+		}
+	}
+	return ts
+}
+
 // UpdateTxn updates the batch transaction from the supplied one in
 // a copy-on-write fashion, i.e. without mutating an existing
 // Transaction struct.
-func (ba *BatchRequest) UpdateTxn(otherTxn *Transaction) {
-	if otherTxn == nil {
+func (ba *BatchRequest) UpdateTxn(o *Transaction) {
+	if o == nil {
 		return
 	}
+	o.AssertInitialized(context.TODO())
 	if ba.Txn == nil {
-		ba.Txn = otherTxn
+		ba.Txn = o
 		return
 	}
 	clonedTxn := ba.Txn.Clone()
-	clonedTxn.Update(otherTxn)
-	ba.Txn = &clonedTxn
+	clonedTxn.Update(o)
+	ba.Txn = clonedTxn
 }
 
 // IsLeaseRequest returns whether the batch consists of a single RequestLease
@@ -94,20 +135,42 @@ func (ba *BatchRequest) IsReadOnly() bool {
 	return len(ba.Requests) > 0 && !ba.hasFlag(isWrite|isAdmin)
 }
 
+// RequiresLeaseHolder returns true if the request can only be served by the
+// leaseholders of the ranges it addresses.
+func (ba *BatchRequest) RequiresLeaseHolder() bool {
+	return ba.IsLocking() || ba.Header.ReadConsistency.RequiresReadLease()
+}
+
 // IsReverse returns true iff the BatchRequest contains a reverse request.
 func (ba *BatchRequest) IsReverse() bool {
 	return ba.hasFlag(isReverse)
 }
 
-// IsPossibleTransaction returns true iff the BatchRequest contains
-// requests that can be part of a transaction.
-func (ba *BatchRequest) IsPossibleTransaction() bool {
+// IsTransactional returns true iff the BatchRequest contains requests that can
+// be part of a transaction.
+func (ba *BatchRequest) IsTransactional() bool {
 	return ba.hasFlag(isTxn)
 }
 
-// IsTransactionWrite returns true iff the BatchRequest contains a txn write.
-func (ba *BatchRequest) IsTransactionWrite() bool {
-	return ba.hasFlag(isTxnWrite)
+// IsAllTransactional returns true iff the BatchRequest contains only requests
+// that can be part of a transaction.
+func (ba *BatchRequest) IsAllTransactional() bool {
+	return ba.hasFlagForAll(isTxn)
+}
+
+// IsLocking returns true iff the BatchRequest intends to acquire locks.
+func (ba *BatchRequest) IsLocking() bool {
+	return ba.hasFlag(isLocking)
+}
+
+// IsIntentWrite returns true iff the BatchRequest contains an intent write.
+func (ba *BatchRequest) IsIntentWrite() bool {
+	return ba.hasFlag(isIntentWrite)
+}
+
+// IsUnsplittable returns true iff the BatchRequest an un-splittable request.
+func (ba *BatchRequest) IsUnsplittable() bool {
+	return ba.hasFlag(isUnsplittable)
 }
 
 // IsSingleRequest returns true iff the BatchRequest contains a single request.
@@ -121,24 +184,109 @@ func (ba *BatchRequest) IsSingleSkipLeaseCheckRequest() bool {
 	return ba.IsSingleRequest() && ba.hasFlag(skipLeaseCheck)
 }
 
+func (ba *BatchRequest) isSingleRequestWithMethod(m Method) bool {
+	return ba.IsSingleRequest() && ba.Requests[0].GetInner().Method() == m
+}
+
+// IsSingleTransferLeaseRequest returns true iff the batch contains a single
+// request, and that request is a TransferLease.
+func (ba *BatchRequest) IsSingleTransferLeaseRequest() bool {
+	return ba.isSingleRequestWithMethod(TransferLease)
+}
+
 // IsSinglePushTxnRequest returns true iff the batch contains a single
-// request, and that request is for a PushTxn.
+// request, and that request is a PushTxn.
 func (ba *BatchRequest) IsSinglePushTxnRequest() bool {
-	if ba.IsSingleRequest() {
-		_, ok := ba.Requests[0].GetInner().(*PushTxnRequest)
-		return ok
+	return ba.isSingleRequestWithMethod(PushTxn)
+}
+
+// IsSingleHeartbeatTxnRequest returns true iff the batch contains a single
+// request, and that request is a HeartbeatTxn.
+func (ba *BatchRequest) IsSingleHeartbeatTxnRequest() bool {
+	return ba.isSingleRequestWithMethod(HeartbeatTxn)
+}
+
+// IsSingleEndTxnRequest returns true iff the batch contains a single request,
+// and that request is an EndTxnRequest.
+func (ba *BatchRequest) IsSingleEndTxnRequest() bool {
+	return ba.isSingleRequestWithMethod(EndTxn)
+}
+
+// IsSingleAbortTxnRequest returns true iff the batch contains a single request,
+// and that request is an EndTxnRequest(commit=false).
+func (ba *BatchRequest) IsSingleAbortTxnRequest() bool {
+	if ba.isSingleRequestWithMethod(EndTxn) {
+		return !ba.Requests[0].GetInner().(*EndTxnRequest).Commit
 	}
 	return false
 }
 
-// IsSingleQueryTxnRequest returns true iff the batch contains a single
-// request, and that request is for a QueryTxn.
-func (ba *BatchRequest) IsSingleQueryTxnRequest() bool {
-	if ba.IsSingleRequest() {
-		_, ok := ba.Requests[0].GetInner().(*QueryTxnRequest)
-		return ok
+// IsSingleRefreshRequest returns true iff the batch contains a single request,
+// and that request is a RefreshRequest.
+func (ba *BatchRequest) IsSingleRefreshRequest() bool {
+	return ba.isSingleRequestWithMethod(Refresh)
+}
+
+// IsSingleSubsumeRequest returns true iff the batch contains a single request,
+// and that request is an SubsumeRequest.
+func (ba *BatchRequest) IsSingleSubsumeRequest() bool {
+	return ba.isSingleRequestWithMethod(Subsume)
+}
+
+// IsSingleComputeChecksumRequest returns true iff the batch contains a single
+// request, and that request is a ComputeChecksumRequest.
+func (ba *BatchRequest) IsSingleComputeChecksumRequest() bool {
+	return ba.isSingleRequestWithMethod(ComputeChecksum)
+}
+
+// IsSingleCheckConsistencyRequest returns true iff the batch contains a single
+// request, and that request is a CheckConsistencyRequest.
+func (ba *BatchRequest) IsSingleCheckConsistencyRequest() bool {
+	return ba.isSingleRequestWithMethod(CheckConsistency)
+}
+
+// IsCompleteTransaction determines whether a batch contains every write in a
+// transactions.
+func (ba *BatchRequest) IsCompleteTransaction() bool {
+	et, hasET := ba.GetArg(EndTxn)
+	if !hasET || !et.(*EndTxnRequest).Commit {
+		return false
 	}
-	return false
+	maxSeq := et.Header().Sequence
+	switch maxSeq {
+	case 0:
+		// If the batch isn't using sequence numbers,
+		// assume that it is not a complete transaction.
+		return false
+	case 1:
+		// The transaction performed no writes.
+		return true
+	}
+	if int(maxSeq) > len(ba.Requests) {
+		// Fast-path.
+		return false
+	}
+	// Check whether any sequence numbers were skipped between 1 and the
+	// EndTxn's sequence number. A Batch is only a complete transaction
+	// if it contains every write that the transaction performed.
+	nextSeq := enginepb.TxnSeq(1)
+	for _, args := range ba.Requests {
+		req := args.GetInner()
+		seq := req.Header().Sequence
+		if seq > nextSeq {
+			return false
+		}
+		if seq == nextSeq {
+			if !IsIntentWrite(req) {
+				return false
+			}
+			nextSeq++
+			if nextSeq == maxSeq {
+				return true
+			}
+		}
+	}
+	panic("unreachable")
 }
 
 // GetPrevLeaseForLeaseRequest returns the previous lease, at the time
@@ -159,14 +307,28 @@ func (ba *BatchRequest) hasFlag(flag int) bool {
 	return false
 }
 
+// hasFlagForAll returns true iff all of the requests within the batch contains
+// the specified flag.
+func (ba *BatchRequest) hasFlagForAll(flag int) bool {
+	if len(ba.Requests) == 0 {
+		return false
+	}
+	for _, union := range ba.Requests {
+		if (union.GetInner().flags() & flag) == 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // GetArg returns a request of the given type if one is contained in the
 // Batch. The request returned is the first of its kind, with the exception
-// of EndTransaction, where it examines the very last request only.
+// of EndTxn, where it examines the very last request only.
 func (ba *BatchRequest) GetArg(method Method) (Request, bool) {
-	// when looking for EndTransaction, just look at the last entry.
-	if method == EndTransaction {
+	// when looking for EndTxn, just look at the last entry.
+	if method == EndTxn {
 		if length := len(ba.Requests); length > 0 {
-			if req := ba.Requests[length-1].GetInner(); req.Method() == EndTransaction {
+			if req := ba.Requests[length-1].GetInner(); req.Method() == EndTxn {
 				return req, true
 			}
 		}
@@ -184,73 +346,111 @@ func (ba *BatchRequest) GetArg(method Method) (Request, bool) {
 func (br *BatchResponse) String() string {
 	var str []string
 	str = append(str, fmt.Sprintf("(err: %v)", br.Error))
-	for _, union := range br.Responses {
+	for count, union := range br.Responses {
+		// Limit the strings to provide just a summary. Without this limit a log
+		// message with a BatchResponse can be very long.
+		if count >= 20 && count < len(br.Responses)-5 {
+			if count == 20 {
+				str = append(str, fmt.Sprintf("... %d skipped ...", len(br.Responses)-25))
+			}
+			continue
+		}
 		str = append(str, fmt.Sprintf("%T", union.GetInner()))
 	}
 	return strings.Join(str, ", ")
 }
 
-// IntentSpanIterate calls the passed method with the key ranges of the
-// transactional writes contained in the batch. Usually the key spans
+// LockSpanIterate calls the passed method with the key ranges of the
+// transactional locks contained in the batch. Usually the key spans
 // contained in the requests are used, but when a response contains a
-// ResumeSpan the ResumeSpan is subtracted from the request span to provide a
-// more minimal span of keys affected by the request.
-func (ba *BatchRequest) IntentSpanIterate(br *BatchResponse, fn func(key, endKey Key)) {
+// ResumeSpan the ResumeSpan is subtracted from the request span to
+// provide a more minimal span of keys affected by the request.
+func (ba *BatchRequest) LockSpanIterate(br *BatchResponse, fn func(Span, lock.Durability)) {
 	for i, arg := range ba.Requests {
 		req := arg.GetInner()
-		if !IsTransactionWrite(req) {
+		if !IsLocking(req) {
 			continue
 		}
-		h := req.Header()
+		var resp Response
 		if br != nil {
-			resumeSpan := br.Responses[i].GetInner().Header().ResumeSpan
-			// If a resume span exists we need to cull the span.
-			if resumeSpan != nil {
-				if bytes.Equal(resumeSpan.Key, h.Key) {
-					if bytes.Equal(resumeSpan.EndKey, h.EndKey) {
-						// Nothing was written.
-						continue
-					}
-					fn(resumeSpan.EndKey, h.EndKey)
-				} else {
-					fn(h.Key, resumeSpan.Key)
-				}
-				continue
-			}
+			resp = br.Responses[i].GetInner()
 		}
-		fn(h.Key, h.EndKey)
+		if span, ok := ActualSpan(req, resp); ok {
+			fn(span, LockingDurability(req))
+		}
 	}
 }
 
-// Combine implements the Combinable interface. It combines each slot of the
-// given request into the corresponding slot of the base response. The number
-// of slots must be equal and the respective slots must be combinable.
-// On error, the receiver BatchResponse is in an invalid state.
-// TODO(tschottdorf): write tests.
-func (br *BatchResponse) Combine(otherBatch *BatchResponse) error {
-	if len(otherBatch.Responses) != len(br.Responses) {
-		return errors.New("unable to combine batch responses of different length")
-	}
-	for i, l := 0, len(br.Responses); i < l; i++ {
-		valLeft := br.Responses[i].GetInner()
-		valRight := otherBatch.Responses[i].GetInner()
-		cValLeft, lOK := valLeft.(combinable)
-		cValRight, rOK := valRight.(combinable)
-		if lOK && rOK {
-			if err := cValLeft.combine(cValRight); err != nil {
-				return err
-			}
+// RefreshSpanIterate calls the passed function with the key spans of
+// requests in the batch which need to be refreshed. These requests
+// must be checked via Refresh/RefreshRange to avoid having to restart
+// a SERIALIZABLE transaction. Usually the key spans contained in the
+// requests are used, but when a response contains a ResumeSpan the
+// ResumeSpan is subtracted from the request span to provide a more
+// minimal span of keys affected by the request. The supplied function
+// is called with each span.
+func (ba *BatchRequest) RefreshSpanIterate(br *BatchResponse, fn func(Span)) {
+	for i, arg := range ba.Requests {
+		req := arg.GetInner()
+		if !NeedsRefresh(req) {
 			continue
 		}
-		// If our slot is a NoopResponse, then whatever the other batch has is
-		// the result. Note that the result can still be a NoopResponse, to be
-		// filled in by a future Combine().
-		if _, ok := valLeft.(*NoopResponse); ok {
-			br.Responses[i] = otherBatch.Responses[i]
+		var resp Response
+		if br != nil {
+			resp = br.Responses[i].GetInner()
+		}
+		if span, ok := ActualSpan(req, resp); ok {
+			fn(span)
 		}
 	}
-	br.Txn.Update(otherBatch.Txn)
-	br.CollectedSpans = append(br.CollectedSpans, otherBatch.CollectedSpans...)
+}
+
+// ActualSpan returns the actual request span which was operated on,
+// according to the existence of a resume span in the response. If
+// nothing was operated on, returns false.
+func ActualSpan(req Request, resp Response) (Span, bool) {
+	h := req.Header()
+	if resp != nil {
+		resumeSpan := resp.Header().ResumeSpan
+		// If a resume span exists we need to cull the span.
+		if resumeSpan != nil {
+			// Handle the reverse case first.
+			if bytes.Equal(resumeSpan.Key, h.Key) {
+				if bytes.Equal(resumeSpan.EndKey, h.EndKey) {
+					return Span{}, false
+				}
+				return Span{Key: resumeSpan.EndKey, EndKey: h.EndKey}, true
+			}
+			// The forward case.
+			return Span{Key: h.Key, EndKey: resumeSpan.Key}, true
+		}
+	}
+	return h.Span(), true
+}
+
+// Combine combines each slot of the given request into the corresponding slot
+// of the base response. The number of slots must be equal and the respective
+// slots must be combinable.
+// On error, the receiver BatchResponse is in an invalid state. In either case,
+// the supplied BatchResponse must not be used any more.
+// It is an error to call Combine on responses with errors in them. The
+// DistSender strips the errors from any responses that it combines.
+func (br *BatchResponse) Combine(otherBatch *BatchResponse, positions []int) error {
+	if err := br.BatchResponse_Header.combine(otherBatch.BatchResponse_Header); err != nil {
+		return err
+	}
+	for i := range otherBatch.Responses {
+		pos := positions[i]
+		if br.Responses[pos] == (ResponseUnion{}) {
+			br.Responses[pos] = otherBatch.Responses[i]
+			continue
+		}
+		valLeft := br.Responses[pos].GetInner()
+		valRight := otherBatch.Responses[i].GetInner()
+		if err := CombineResponses(valLeft, valRight); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -282,19 +482,26 @@ func (ba *BatchRequest) Methods() []Method {
 // Split separates the requests contained in a batch so that each subset of
 // requests can be executed by a Store (without changing order). In particular,
 // Admin requests are always singled out and mutating requests separated from
-// reads. The boolean parameter indicates whether EndTransaction should be
-// special-cased: If false, an EndTransaction request will never be split into
-// a new chunk (otherwise, it is treated according to its flags). This allows
-// sending a whole transaction in a single Batch when addressing a single
-// range.
+// reads. The boolean parameter indicates whether EndTxn should be
+// special-cased: If false, an EndTxn request will never be split into a new
+// chunk (otherwise, it is treated according to its flags). This allows sending
+// a whole transaction in a single Batch when addressing a single range.
+//
+// NOTE: One reason for splitting reads from writes is that write-only batches
+// can sometimes have their read timestamp bumped on the server, which doesn't
+// work for read requests due to how the timestamp-aware latching works (i.e. a
+// read that acquired a latch @ ts10 can't simply be bumped to ts 20 because
+// there might have been overlapping writes in the 10..20 window).
 func (ba BatchRequest) Split(canSplitET bool) [][]RequestUnion {
-	compatible := func(method Method, exFlags, newFlags int) bool {
-		// If no flags are set so far, everything goes.
-		if exFlags == 0 || (!canSplitET && method == EndTransaction) {
-			return true
-		}
-		if (newFlags & isAlone) != 0 {
+	compatible := func(exFlags, newFlags int) bool {
+		// isAlone requests are never compatible.
+		if (exFlags&isAlone) != 0 || (newFlags&isAlone) != 0 {
 			return false
+		}
+		// If the current or new flags are empty and neither include isAlone,
+		// everything goes.
+		if exFlags == 0 || newFlags == 0 {
+			return true
 		}
 		// Otherwise, the flags below must remain the same with the new
 		// request added.
@@ -309,20 +516,51 @@ func (ba BatchRequest) Split(canSplitET bool) [][]RequestUnion {
 	var parts [][]RequestUnion
 	for len(ba.Requests) > 0 {
 		part := ba.Requests
-		var gFlags int
+		var gFlags, hFlags = -1, -1
 		for i, union := range ba.Requests {
 			args := union.GetInner()
 			flags := args.flags()
 			method := args.Method()
-			// Regardless of flags, a NoopRequest is always compatible.
-			if method == Noop {
-				continue
+			if (flags & isPrefix) != 0 {
+				// Requests with the isPrefix flag want to be grouped with the
+				// next non-header request in a batch. Scan forward and find
+				// first non-header request. Naively, this would result in
+				// quadratic behavior for repeat isPrefix requests. We avoid
+				// this by caching first non-header request's flags in hFlags.
+				if hFlags == -1 {
+					for _, nUnion := range ba.Requests[i+1:] {
+						nArgs := nUnion.GetInner()
+						nFlags := nArgs.flags()
+						nMethod := nArgs.Method()
+						if !canSplitET && nMethod == EndTxn {
+							nFlags = 0 // always compatible
+						}
+						if (nFlags & isPrefix) == 0 {
+							hFlags = nFlags
+							break
+						}
+					}
+				}
+				if hFlags != -1 && (hFlags&isAlone) == 0 {
+					flags = hFlags
+				}
+			} else {
+				hFlags = -1 // reset
 			}
-			if !compatible(method, gFlags, flags) {
-				part = ba.Requests[:i]
-				break
+			cmpFlags := flags
+			if !canSplitET && method == EndTxn {
+				cmpFlags = 0 // always compatible
 			}
-			gFlags |= flags
+			if gFlags == -1 {
+				// If no flags are set so far, everything goes.
+				gFlags = flags
+			} else {
+				if !compatible(gFlags, cmpFlags) {
+					part = ba.Requests[:i]
+					break
+				}
+				gFlags |= flags
+			}
 		}
 		parts = append(parts, part)
 		ba.Requests = ba.Requests[len(part):]
@@ -330,53 +568,73 @@ func (ba BatchRequest) Split(canSplitET bool) [][]RequestUnion {
 	return parts
 }
 
-// String gives a brief summary of the contained requests and keys in the batch.
-// TODO(tschottdorf): the key range is useful information, but requires `keys`.
-// See #2198.
-func (ba BatchRequest) String() string {
-	var str []string
-	if ba.Txn != nil {
-		str = append(str, fmt.Sprintf("[txn: %s]", ba.Txn.Short()))
-	}
+// SafeFormat implements redact.SafeFormatter.
+// It gives a brief summary of the contained requests and keys in the batch.
+func (ba BatchRequest) SafeFormat(s redact.SafePrinter, _ rune) {
 	for count, arg := range ba.Requests {
 		// Limit the strings to provide just a summary. Without this limit
 		// a log message with a BatchRequest can be very long.
 		if count >= 20 && count < len(ba.Requests)-5 {
 			if count == 20 {
-				str = append(str, fmt.Sprintf("... %d skipped ...", len(ba.Requests)-25))
+				s.Printf(",... %d skipped ...", len(ba.Requests)-25)
 			}
 			continue
 		}
+		if count > 0 {
+			s.Print(redact.SafeString(", "))
+		}
+
 		req := arg.GetInner()
-		if _, ok := req.(*NoopRequest); ok {
-			str = append(str, req.Method().String())
+		if et, ok := req.(*EndTxnRequest); ok {
+			h := req.Header()
+			s.Printf("%s(commit:%t", req.Method(), et.Commit)
+			if et.InternalCommitTrigger != nil {
+				s.Printf(" %s", et.InternalCommitTrigger.Kind())
+			}
+			s.Printf(") [%s]", h.Key)
 		} else {
 			h := req.Header()
-			str = append(str, fmt.Sprintf("%s [%s,%s)", req.Method(), h.Key, h.EndKey))
+			if req.Method() == PushTxn {
+				pushReq := req.(*PushTxnRequest)
+				s.Printf("PushTxn(%s->%s)", pushReq.PusherTxn.Short(), pushReq.PusheeTxn.Short())
+			} else {
+				s.Print(req.Method())
+			}
+			s.Printf(" [%s,%s)", h.Key, h.EndKey)
 		}
 	}
-	return strings.Join(str, ", ")
-}
-
-// TODO(marc): we should assert
-// var _ security.RequestWithUser = &BatchRequest{}
-// here, but we need to break cycles first.
-
-// GetUser implements security.RequestWithUser.
-// KV messages are always sent by the node user.
-func (*BatchRequest) GetUser() string {
-	// TODO(marc): we should use security.NodeUser here, but we need to break cycles first.
-	return "node"
-}
-
-// SetNewRequest increases the internal sequence counter of this batch request.
-// The sequence counter is used for replay and reordering protection. At the
-// Store, a sequence counter less than or equal to the last observed one incurs
-// a transaction restart (if the request is transactional).
-func (ba *BatchRequest) SetNewRequest() {
-	if ba.Txn != nil {
-		txn := *ba.Txn
-		txn.Sequence++
-		ba.Txn = &txn
+	{
+		if ba.Txn != nil {
+			s.Printf(", [txn: %s]", ba.Txn.Short())
+		}
 	}
+	if ba.WaitPolicy != lock.WaitPolicy_Block {
+		s.Printf(", [wait-policy: %s]", ba.WaitPolicy)
+	}
+	if ba.CanForwardReadTimestamp {
+		s.Printf(", [can-forward-ts]")
+	}
+}
+
+func (ba BatchRequest) String() string {
+	return redact.StringWithoutMarkers(ba)
+}
+
+// ValidateForEvaluation performs sanity checks on the batch when it's received
+// by the "server" for evaluation.
+func (ba BatchRequest) ValidateForEvaluation() error {
+	if ba.RangeID == 0 {
+		return errors.AssertionFailedf("batch request missing range ID")
+	} else if ba.Replica.StoreID == 0 {
+		return errors.AssertionFailedf("batch request missing store ID")
+	}
+	if _, ok := ba.GetArg(EndTxn); ok && ba.Txn == nil {
+		return errors.AssertionFailedf("EndTxn request without transaction")
+	}
+	if ba.Txn != nil {
+		if ba.Txn.WriteTooOld && ba.Txn.ReadTimestamp == ba.Txn.WriteTimestamp {
+			return errors.AssertionFailedf("WriteTooOld set but no offset in timestamps. txn: %s", ba.Txn)
+		}
+	}
+	return nil
 }

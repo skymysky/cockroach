@@ -1,154 +1,75 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Vivek Menezes (vivek.menezes@gmail.com)
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
-	"bytes"
+	"context"
 
-	"golang.org/x/net/context"
-
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util"
 )
 
 // distinctNode de-duplicates rows returned by a wrapped planNode.
 type distinctNode struct {
 	plan planNode
-	p    *planner
-	// All the columns that are part of the Sort. Set to nil if no-sort, or
-	// sort used an expression that was not part of the requested column set.
-	columnsInOrder []bool
-	// Encoding of the columnsInOrder columns for the previous row.
-	prefixSeen   []byte
-	prefixMemAcc WrappableMemoryAccount
 
-	// Encoding of the non-columnInOrder columns for rows sharing the same
-	// prefixSeen value.
-	suffixSeen   map[string]struct{}
-	suffixMemAcc WrappableMemoryAccount
+	// distinctOnColIdxs are the column indices of the child planNode and
+	// is what defines the distinct key.
+	// For a normal DISTINCT (without the ON clause), distinctOnColIdxs
+	// contains all the column indices of the child planNode.
+	// Otherwise, distinctOnColIdxs is a strict subset of the child
+	// planNode's column indices indicating which columns are specified in
+	// the DISTINCT ON (<exprs>) clause.
+	distinctOnColIdxs util.FastIntSet
+
+	// Subset of distinctOnColIdxs on which the input guarantees an ordering.
+	// All rows that are equal on these columns appear contiguously in the input.
+	columnsInOrder util.FastIntSet
+
+	reqOrdering ReqOrdering
+
+	// nullsAreDistinct, if true, causes the distinct operation to treat NULL
+	// values as not equal to one another. Each NULL value will cause a new row
+	// group to be created. For example:
+	//
+	//   c
+	//   ----
+	//   NULL
+	//   NULL
+	//
+	// A distinct operation on column "c" will result in one output row if
+	// nullsAreDistinct is false, or two output rows if true. This is set to true
+	// for UPSERT and INSERT..ON CONFLICT statements, since they must treat NULL
+	// values as distinct.
+	nullsAreDistinct bool
+
+	// errorOnDup, if non-empty, is the text of the error that will be raised if
+	// the distinct operation finds two rows with duplicate grouping column
+	// values. This is used to implement the UPSERT and INSERT..ON CONFLICT
+	// statements, both of which prohibit the same row from being changed twice.
+	errorOnDup string
 }
 
-// distinct constructs a distinctNode.
-func (p *planner) Distinct(n *parser.SelectClause) *distinctNode {
-	if !n.Distinct {
-		return nil
-	}
-	d := &distinctNode{p: p}
-	d.prefixMemAcc = p.session.TxnState.OpenAccount()
-	d.suffixMemAcc = p.session.TxnState.OpenAccount()
-	return d
+func (n *distinctNode) startExec(params runParams) error {
+	panic("distinctNode can't be called in local mode")
 }
 
-func (n *distinctNode) Start(ctx context.Context) error {
-	n.suffixSeen = make(map[string]struct{})
-	return n.plan.Start(ctx)
+func (n *distinctNode) Next(params runParams) (bool, error) {
+	panic("distinctNode can't be called in local mode")
 }
 
-func (n *distinctNode) Values() parser.Datums { return n.plan.Values() }
-
-func (n *distinctNode) addSuffixSeen(
-	ctx context.Context, acc WrappedMemoryAccount, sKey string,
-) error {
-	sz := int64(len(sKey))
-	if err := acc.Grow(ctx, sz); err != nil {
-		return err
-	}
-	n.suffixSeen[sKey] = struct{}{}
-	return nil
-}
-
-func (n *distinctNode) Next(ctx context.Context) (bool, error) {
-
-	prefixMemAcc := n.prefixMemAcc.Wtxn(n.p.session)
-	suffixMemAcc := n.suffixMemAcc.Wtxn(n.p.session)
-
-	for {
-		next, err := n.plan.Next(ctx)
-		if !next {
-			return false, err
-		}
-
-		// Detect duplicates
-		prefix, suffix, err := n.encodeValues(n.Values())
-		if err != nil {
-			return false, err
-		}
-
-		if !bytes.Equal(prefix, n.prefixSeen) {
-			// The prefix of the row which is ordered differs from the last row;
-			// reset our seen set.
-			if len(n.suffixSeen) > 0 {
-				suffixMemAcc.Clear(ctx)
-				n.suffixSeen = make(map[string]struct{})
-			}
-			if err := prefixMemAcc.ResizeItem(ctx, int64(len(n.prefixSeen)), int64(len(prefix))); err != nil {
-				return false, err
-			}
-			n.prefixSeen = prefix
-			if suffix != nil {
-				if err := n.addSuffixSeen(ctx, suffixMemAcc, string(suffix)); err != nil {
-					return false, err
-				}
-			}
-			return true, nil
-		}
-
-		// The prefix of the row is the same as the last row; check
-		// to see if the suffix which is not ordered has been seen.
-		if suffix != nil {
-			sKey := string(suffix)
-			if _, ok := n.suffixSeen[sKey]; !ok {
-				if err := n.addSuffixSeen(ctx, suffixMemAcc, sKey); err != nil {
-					return false, err
-				}
-				return true, nil
-			}
-		}
-	}
-}
-
-// TODO(irfansharif): This can be refactored away to use
-// sqlbase.EncodeDatums([]byte, parser.Datums)
-func (n *distinctNode) encodeValues(values parser.Datums) ([]byte, []byte, error) {
-	var prefix, suffix []byte
-	var err error
-	for i, val := range values {
-		if n.columnsInOrder != nil && n.columnsInOrder[i] {
-			if prefix == nil {
-				prefix = make([]byte, 0, 100)
-			}
-			prefix, err = sqlbase.EncodeDatum(prefix, val)
-		} else {
-			if suffix == nil {
-				suffix = make([]byte, 0, 100)
-			}
-			suffix, err = sqlbase.EncodeDatum(suffix, val)
-		}
-		if err != nil {
-			break
-		}
-	}
-	return prefix, suffix, err
+func (n *distinctNode) Values() tree.Datums {
+	panic("distinctNode can't be called in local mode")
 }
 
 func (n *distinctNode) Close(ctx context.Context) {
 	n.plan.Close(ctx)
-	n.prefixSeen = nil
-	n.prefixMemAcc.Wtxn(n.p.session).Close(ctx)
-	n.suffixSeen = nil
-	n.suffixMemAcc.Wtxn(n.p.session).Close(ctx)
 }

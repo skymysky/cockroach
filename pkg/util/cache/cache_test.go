@@ -1,20 +1,14 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 //
 // This code is based on: https://github.com/golang/groupcache/
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package cache
 
@@ -24,7 +18,6 @@ import (
 	"testing"
 
 	"github.com/biogo/store/llrb"
-
 	_ "github.com/cockroachdb/cockroach/pkg/util/log" // for flags
 )
 
@@ -146,7 +139,11 @@ func TestCacheLRU(t *testing.T) {
 	if _, ok := mc.Get(testKey("a")); !ok {
 		t.Fatal("failed to get key a")
 	}
-	// Add another entry to evict; should evict key "b".
+	// Verify that a StealthyGet won't make b the most recently used.
+	if _, ok := mc.StealthyGet(testKey("b")); !ok {
+		t.Fatal("failed to get key b")
+	}
+	// Add another entry to cause an eviction; should evict key "b".
 	mc.Add(testKey("c"), 3)
 	// Verify eviction of least recently used key "b".
 	if _, ok := mc.Get(testKey("b")); ok {
@@ -214,6 +211,35 @@ func TestOrderedCache(t *testing.T) {
 	}
 	if _, v, ok := oc.Floor(testKey("c")); !ok || v.(int) != 2 {
 		t.Error("expected fetch of key \"b\" for floor of maximum key")
+	}
+
+	// Test do over entire cache.
+	expKeys, collectKeys := []string{"a", "b"}, []string{}
+	expVals, collectVals := []int{1, 2}, []int{}
+	collect := func(k, v interface{}) bool {
+		collectKeys = append(collectKeys, string(k.(testKey)))
+		collectVals = append(collectVals, v.(int))
+		return false
+	}
+
+	oc.Do(collect)
+	if !reflect.DeepEqual(expKeys, collectKeys) {
+		t.Errorf("expected do to find keys %v, found %v", expKeys, collectKeys)
+	}
+	if !reflect.DeepEqual(expVals, collectVals) {
+		t.Errorf("expected do to find values %v, found %v", expVals, collectVals)
+	}
+
+	// Test doRange over range ["a","b").
+	expKeys, collectKeys = []string{"a"}, []string{}
+	expVals, collectVals = []int{1}, []int{}
+
+	oc.DoRange(collect, testKey("a"), testKey("b"))
+	if !reflect.DeepEqual(expKeys, collectKeys) {
+		t.Errorf("expected do to find keys %v, found %v", expKeys, collectKeys)
+	}
+	if !reflect.DeepEqual(expVals, collectVals) {
+		t.Errorf("expected do to find values %v, found %v", expVals, collectVals)
 	}
 }
 

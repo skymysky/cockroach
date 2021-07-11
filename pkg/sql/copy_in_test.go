@@ -1,47 +1,51 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Matt Jibson
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql_test
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"math/rand"
+	"net/url"
 	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
-
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/tests"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/util/duration"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
+	"github.com/cockroachdb/cockroach/pkg/util/timetz"
+	"github.com/jackc/pgx/v4"
 	"github.com/lib/pq"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCopyNullInfNaN(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	params, _ := createTestServerParams()
+	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -52,11 +56,18 @@ func TestCopyNullInfNaN(t *testing.T) {
 			s STRING NULL,
 			b BYTES NULL,
 			d DATE NULL,
-			t TIMESTAMP NULL,
+			t TIME NULL,
+			ttz TIME NULL,
+			ts TIMESTAMP NULL,
 			n INTERVAL NULL,
 			o BOOL NULL,
 			e DECIMAL NULL,
-			tz TIMESTAMP WITH TIME ZONE NULL
+			u UUID NULL,
+			ip INET NULL,
+			tz TIMESTAMPTZ NULL,
+			geography GEOGRAPHY NULL,
+			geometry GEOMETRY NULL,
+			box2d BOX2D NULL
 		);
 	`); err != nil {
 		t.Fatal(err)
@@ -67,16 +78,18 @@ func TestCopyNullInfNaN(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stmt, err := txn.Prepare(pq.CopyIn("t"))
+	stmt, err := txn.Prepare(pq.CopyIn(
+		"t", "i", "f", "s", "b", "d", "t", "ttz",
+		"ts", "n", "o", "e", "u", "ip", "tz", "geography", "geometry", "box2d"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	input := [][]interface{}{
-		{nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
-		{nil, math.Inf(1), nil, nil, nil, nil, nil, nil, nil, nil},
-		{nil, math.Inf(-1), nil, nil, nil, nil, nil, nil, nil, nil},
-		{nil, math.NaN(), nil, nil, nil, nil, nil, nil, nil, nil},
+		{nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
+		{nil, math.Inf(1), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
+		{nil, math.Inf(-1), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
+		{nil, math.NaN(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
 	}
 
 	for _, in := range input {
@@ -125,14 +138,15 @@ func TestCopyNullInfNaN(t *testing.T) {
 	}
 }
 
-// TestCopyRandom inserts 100 random rows using COPY and ensures the SELECT'd
+// TestCopyRandom inserts random rows using COPY and ensures the SELECT'd
 // data is the same.
 func TestCopyRandom(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	params, _ := createTestServerParams()
+	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -143,11 +157,19 @@ func TestCopyRandom(t *testing.T) {
 			i INT,
 			f FLOAT,
 			e DECIMAL,
-			t TIMESTAMP,
+			t TIME,
+			ttz TIMETZ,
+			ts TIMESTAMP,
 			s STRING,
 			b BYTES,
-			tz TIMESTAMP WITH TIME ZONE
+			u UUID,
+			ip INET,
+			tz TIMESTAMPTZ,
+			geography GEOGRAPHY NULL,
+			geometry GEOMETRY NULL,
+			box2d BOX2D NULL
 		);
+		SET extra_float_digits = 3; -- to preserve floats entirely
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -157,46 +179,50 @@ func TestCopyRandom(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stmt, err := txn.Prepare(pq.CopyInSchema("d", "t", "id", "n", "o", "i", "f", "e", "t", "s", "b", "tz"))
+	stmt, err := txn.Prepare(pq.CopyInSchema("d", "t", "id", "n", "o", "i", "f", "e", "t", "ttz", "ts", "s", "b", "u", "ip", "tz", "geography", "geometry", "box2d"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	rng := rand.New(rand.NewSource(0))
-	types := []sqlbase.ColumnType_SemanticType{
-		sqlbase.ColumnType_BOOL,
-		sqlbase.ColumnType_INT,
-		sqlbase.ColumnType_FLOAT,
-		sqlbase.ColumnType_DECIMAL,
-		sqlbase.ColumnType_TIMESTAMP,
-		sqlbase.ColumnType_STRING,
-		sqlbase.ColumnType_BYTES,
-		sqlbase.ColumnType_TIMESTAMPTZ,
+	typs := []*types.T{
+		types.Int,
+		types.Interval,
+		types.Bool,
+		types.Int,
+		types.Float,
+		types.Decimal,
+		types.Time,
+		types.TimeTZ,
+		types.Timestamp,
+		types.String,
+		types.Bytes,
+		types.Uuid,
+		types.INet,
+		types.TimestampTZ,
+		types.Geography,
+		types.Geometry,
+		types.Box2D,
 	}
 
 	var inputs [][]interface{}
 
-	for i := 0; i < 100; i++ {
-		row := make([]interface{}, len(types)+2)
-		row[0] = strconv.Itoa(i)
-
-		sign := 1 - rng.Int63n(2)*2
-		d := duration.Duration{
-			Months: sign * rng.Int63n(1000),
-			Days:   sign * rng.Int63n(1000),
-			Nanos:  sign * rng.Int63(),
-		}
-
-		row[1] = d.String()
-		for j, t := range types {
-			d := sqlbase.RandDatum(rng, sqlbase.ColumnType{SemanticType: t}, false)
-			ds := parser.AsStringWithFlags(d, parser.FmtBareStrings)
-			switch t {
-			case sqlbase.ColumnType_DECIMAL:
-				// Trailing 0s aren't represented below, so truncate here.
-				ds = strings.TrimRight(ds, "0")
+	for i := 0; i < 1000; i++ {
+		row := make([]interface{}, len(typs))
+		for j, t := range typs {
+			var ds string
+			if j == 0 {
+				// Special handling for ID field
+				ds = strconv.Itoa(i)
+			} else {
+				d := randgen.RandDatum(rng, t, false)
+				ds = tree.AsStringWithFlags(d, tree.FmtBareStrings)
+				switch t {
+				case types.Float:
+					ds = strings.TrimSuffix(ds, ".0")
+				}
 			}
-			row[j+2] = ds
+			row[j] = ds
 		}
 		_, err = stmt.Exec(row...)
 		if err != nil {
@@ -239,8 +265,17 @@ func TestCopyRandom(t *testing.T) {
 			case []byte:
 				ds = string(d)
 			case time.Time:
-				dt := parser.MakeDTimestamp(d, time.Microsecond)
-				ds = parser.AsStringWithFlags(dt, parser.FmtBareStrings)
+				var dt tree.NodeFormatter
+				if typs[i].Family() == types.TimeFamily {
+					dt = tree.MakeDTime(timeofday.FromTimeAllow2400(d))
+				} else if typs[i].Family() == types.TimeTZFamily {
+					dt = tree.NewDTimeTZ(timetz.MakeTimeTZFromTimeAllow2400(d))
+				} else if typs[i].Family() == types.TimestampFamily {
+					dt = tree.MustMakeDTimestamp(d, time.Microsecond)
+				} else {
+					dt = tree.MustMakeDTimestampTZ(d, time.Microsecond)
+				}
+				ds = tree.AsStringWithFlags(dt, tree.FmtBareStrings)
 			}
 			if !reflect.DeepEqual(in[i], ds) {
 				t.Fatalf("row %v, col %v: got %#v (%T), expected %#v", row, i, ds, d, in[i])
@@ -249,12 +284,82 @@ func TestCopyRandom(t *testing.T) {
 	}
 }
 
+// TestCopyBinary uses the pgx driver, which hard codes COPY ... BINARY.
+func TestCopyBinary(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	params, _ := tests.CreateTestServerParams()
+	s, db, _ := serverutils.StartServer(t, params)
+	sqlDB := sqlutils.MakeSQLRunner(db)
+	defer s.Stopper().Stop(ctx)
+
+	pgURL, cleanupGoDB := sqlutils.PGUrl(
+		t, s.ServingSQLAddr(), "StartServer" /* prefix */, url.User(security.RootUser))
+	defer cleanupGoDB()
+	conn, err := pgx.Connect(ctx, pgURL.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE t (
+			id INT8 PRIMARY KEY,
+			u INT, -- NULL test
+			o BOOL,
+			i2 INT2,
+			i4 INT4,
+			i8 INT8,
+			f FLOAT,
+			s STRING,
+			b BYTES
+		);
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	input := [][]interface{}{{
+		1,
+		nil,
+		true,
+		int16(1),
+		int32(1),
+		int64(1),
+		float64(1),
+		"s",
+		"b",
+	}}
+	if _, err = conn.CopyFrom(
+		ctx,
+		pgx.Identifier{"t"},
+		[]string{"id", "u", "o", "i2", "i4", "i8", "f", "s", "b"},
+		pgx.CopyFromRows(input),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	expect := func() [][]string {
+		row := make([]string, len(input[0]))
+		for i, v := range input[0] {
+			if v == nil {
+				row[i] = "NULL"
+			} else {
+				row[i] = fmt.Sprintf("%v", v)
+			}
+		}
+		return [][]string{row}
+	}()
+	sqlDB.CheckQueryResults(t, "SELECT * FROM t ORDER BY id", expect)
+}
+
 func TestCopyError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	params, _ := createTestServerParams()
+	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -301,82 +406,15 @@ func TestCopyError(t *testing.T) {
 	}
 }
 
-// TestCopyOne verifies that only one COPY can run at once.
-func TestCopyOne(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	t.Skip("https://github.com/lib/pq/issues/558")
-
-	params, _ := createTestServerParams()
-	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
-
-	if _, err := db.Exec(`
-		CREATE DATABASE d;
-		SET DATABASE = d;
-		CREATE TABLE t (
-			i INT PRIMARY KEY
-		);
-	`); err != nil {
-		t.Fatal(err)
-	}
-
-	txn, err := db.Begin()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := txn.Prepare(pq.CopyIn("t", "i")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := txn.Prepare(pq.CopyIn("t", "i")); err == nil {
-		t.Fatal("expected error")
-	}
-}
-
-// TestCopyInProgress verifies that after a COPY has started another statement
-// cannot run.
-func TestCopyInProgress(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	t.Skip("https://github.com/lib/pq/issues/558")
-
-	params, _ := createTestServerParams()
-	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
-
-	if _, err := db.Exec(`
-		CREATE DATABASE d;
-		SET DATABASE = d;
-		CREATE TABLE t (
-			i INT PRIMARY KEY
-		);
-	`); err != nil {
-		t.Fatal(err)
-	}
-
-	txn, err := db.Begin()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := txn.Prepare(pq.CopyIn("t", "i")); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := txn.Query("SELECT 1"); err == nil {
-		t.Fatal("expected error")
-	}
-}
-
 // TestCopyTransaction verifies that COPY data can be used after it is done
 // within a transaction.
 func TestCopyTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	params, _ := createTestServerParams()
+	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -393,6 +431,9 @@ func TestCopyTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Note that, at least with lib/pq, this doesn't actually send a Parse msg
+	// (which we wouldn't support, as we don't support Copy-in in extended
+	// protocol mode). lib/pq has magic for recognizing a Copy.
 	stmt, err := txn.Prepare(pq.CopyIn("t", "i"))
 	if err != nil {
 		t.Fatal(err)
@@ -418,4 +459,90 @@ func TestCopyTransaction(t *testing.T) {
 	if err := txn.Commit(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestCopyFKCheck verifies that foreign keys are checked during COPY.
+func TestCopyFKCheck(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	params, _ := tests.CreateTestServerParams()
+	s, db, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.Background())
+
+	db.SetMaxOpenConns(1)
+	r := sqlutils.MakeSQLRunner(db)
+	r.Exec(t, `
+		CREATE DATABASE d;
+		SET DATABASE = d;
+		CREATE TABLE p (p INT PRIMARY KEY);
+		CREATE TABLE t (
+		  a INT PRIMARY KEY,
+		  p INT REFERENCES p(p)
+		);
+	`)
+
+	txn, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = txn.Rollback() }()
+
+	stmt, err := txn.Prepare(pq.CopyIn("t", "a", "p"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = stmt.Exec(1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = stmt.Close()
+	if !testutils.IsError(err, "foreign key violation|violates foreign key constraint") {
+		t.Fatalf("expected FK error, got: %v", err)
+	}
+}
+
+// TestCopyInReleasesLeases is a regression test to ensure that the execution
+// of CopyIn does not retain table descriptor leases after completing by
+// attempting to run a schema change after performing a copy.
+func TestCopyInReleasesLeases(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	params, _ := tests.CreateTestServerParams()
+	s, db, _ := serverutils.StartServer(t, params)
+	tdb := sqlutils.MakeSQLRunner(db)
+	defer s.Stopper().Stop(context.Background())
+	tdb.Exec(t, `CREATE TABLE t (k INT8 PRIMARY KEY)`)
+	tdb.Exec(t, `CREATE USER foo WITH PASSWORD 'testabc'`)
+	tdb.Exec(t, `GRANT admin TO foo`)
+
+	userURL, cleanupFn := sqlutils.PGUrlWithOptionalClientCerts(t,
+		s.ServingSQLAddr(), t.Name(), url.UserPassword("foo", "testabc"),
+		false /* withClientCerts */)
+	defer cleanupFn()
+	conn, err := pgxConn(t, userURL)
+	require.NoError(t, err)
+
+	tag, err := conn.CopyFromReader(strings.NewReader("1\n2\n"),
+		"copy t(k) from stdin")
+	require.NoError(t, err)
+	require.Equal(t, int64(2), tag.RowsAffected())
+
+	// Prior to the bug fix which prompted this test, the below schema change
+	// would hang until the leases expire. Let's make sure it finishes "soon".
+	alterErr := make(chan error, 1)
+	go func() {
+		_, err := db.Exec(`ALTER TABLE t ADD COLUMN v INT NOT NULL DEFAULT 0`)
+		alterErr <- err
+	}()
+	select {
+	case err := <-alterErr:
+		require.NoError(t, err)
+	case <-time.After(testutils.DefaultSucceedsSoonDuration):
+		t.Fatal("alter did not complete")
+	}
+	require.NoError(t, conn.Close())
 }

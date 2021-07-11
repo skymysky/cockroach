@@ -1,18 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt.r.tracy@gmail.com)
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package ts
 
@@ -24,7 +18,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 )
 
 // Time series keys are carefully constructed to usefully sort the data in the
@@ -81,7 +76,8 @@ func makeDataKeySeriesPrefix(name string, r Resolution) roachpb.Key {
 	return k
 }
 
-// DecodeDataKey decodes a time series key into its components.
+// DecodeDataKey decodes a time series key into its components:
+// name, source, resolution, timestamp.
 func DecodeDataKey(key roachpb.Key) (string, string, Resolution, int64, error) {
 	// Detect and remove prefix.
 	remainder := key
@@ -123,10 +119,10 @@ func prettyPrintKey(key roachpb.Key) string {
 	if err != nil {
 		// Not a valid timeseries key, fall back to doing the best we can to display
 		// it.
-		return encoding.PrettyPrintValue(key, "/")
+		return encoding.PrettyPrintValue(nil /* dirs */, key, "/")
 	}
 	return fmt.Sprintf("/%s/%s/%s/%s", name, source, resolution,
-		time.Unix(0, timestamp).UTC().Format(time.RFC3339Nano))
+		timeutil.Unix(0, timestamp).Format(time.RFC3339Nano))
 }
 
 func init() {

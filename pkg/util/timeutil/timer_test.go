@@ -1,22 +1,17 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Nathan VanBenschoten (nvanbenschoten@gmail.com)
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package timeutil
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -43,17 +38,36 @@ func TestTimerTimeout(t *testing.T) {
 }
 
 func TestTimerStop(t *testing.T) {
-	var timer Timer
-	timer.Reset(timeStep)
-	if stopped := timer.Stop(); !stopped {
-		t.Errorf("expected Stop to return true, got false")
+	for sleepMult := time.Duration(0); sleepMult < 3; sleepMult++ {
+		sleepDur := sleepMult * timeStep
+		t.Run(fmt.Sprintf("sleepDur=%d*timeStep", sleepMult), func(t *testing.T) {
+			var timer Timer
+			timer.Reset(timeStep)
+			time.Sleep(sleepDur)
+
+			// Get a handle to the timer channel before calling Stop, because Stop
+			// clears the struct.
+			c := timer.C
+
+			// Even though we sleep for a certain duration which we know to be more
+			// or less than the timer's duration, we can't assert whether the timer
+			// fires before calling timer.Stop because we have no control over the
+			// scheduler. Instead, we handle both cases to avoid flakiness and assert
+			// that Stop returns the correct status.
+			stopped := timer.Stop()
+			select {
+			case <-c:
+				if stopped {
+					t.Errorf("timer unexpectedly fired after stopping")
+				}
+			case <-time.After(5 * timeStep):
+				if !stopped {
+					t.Errorf("timer did not fire after failing to stop")
+				}
+			}
+		})
 	}
 
-	select {
-	case <-timer.C:
-		t.Errorf("expected timer to stop after call to Stop; got timer that was not stopped")
-	case <-time.After(5 * timeStep):
-	}
 }
 
 func TestTimerUninitializedStopNoop(t *testing.T) {

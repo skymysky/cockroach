@@ -1,31 +1,24 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Andrei Matei (andreimatei1@gmail.com)
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package testutils
 
 import (
+	"context"
 	"io"
 	"net"
 	"sync"
 
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 )
 
 // bufferSize is the size of the buffer used by PartitionableConn. Writes to a
@@ -103,14 +96,13 @@ type buf struct {
 }
 
 func makeBuf(name string, capacity int, mu *syncutil.Mutex) buf {
-	b := buf{
-		Mutex:    mu,
-		name:     name,
-		capacity: capacity,
+	return buf{
+		Mutex:        mu,
+		name:         name,
+		capacity:     capacity,
+		readerWait:   sync.NewCond(mu),
+		capacityWait: sync.NewCond(mu),
 	}
-	b.readerWait = sync.NewCond(b.Mutex)
-	b.capacityWait = sync.NewCond(b.Mutex)
-	return b
 }
 
 // Write adds data to the buffer. If there's zero free capacity, it will block
@@ -139,7 +131,7 @@ func (b *buf) Write(data []byte) (int, error) {
 }
 
 // errEAgain is returned by buf.readLocked() when the read was blocked at the
-// time when buf.readerWait was signalled (in particular, after the
+// time when buf.readerWait was signaled (in particular, after the
 // PartitionableConn interrupted the read because of a partition). The caller is
 // expected to try the read again after the partition is gone.
 var errEAgain = errors.New("try read again")
@@ -174,11 +166,11 @@ func (b *buf) readLocked(size int) ([]byte, error) {
 // be woken and they'll all return err.
 func (b *buf) Close(err error) {
 	b.Lock()
+	defer b.Unlock()
 	b.closed = true
 	b.closedErr = err
 	b.readerWait.Signal()
 	b.capacityWait.Signal()
-	b.Unlock()
 }
 
 // wakeReaderLocked wakes the reader in case it's blocked.
@@ -255,57 +247,57 @@ func NewPartitionableConn(serverConn net.Conn) *PartitionableConn {
 // state.
 func (c *PartitionableConn) Finish() {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.mu.c2sPartitioned = false
 	c.mu.c2sWaiter.Signal()
 	c.mu.s2cPartitioned = false
 	c.mu.s2cWaiter.Signal()
-	c.mu.Unlock()
 }
 
 // PartitionC2S partitions the client-to-server direction.
 // If UnpartitionC2S() is not called, Finish() must be called.
 func (c *PartitionableConn) PartitionC2S() {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.mu.c2sPartitioned {
 		panic("already partitioned")
 	}
 	c.mu.c2sPartitioned = true
 	c.mu.c2sBuffer.wakeReaderLocked()
-	c.mu.Unlock()
 }
 
 // UnpartitionC2S lifts an existing client-to-server partition.
 func (c *PartitionableConn) UnpartitionC2S() {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	if !c.mu.c2sPartitioned {
 		panic("not partitioned")
 	}
 	c.mu.c2sPartitioned = false
 	c.mu.c2sWaiter.Signal()
-	c.mu.Unlock()
 }
 
 // PartitionS2C partitions the server-to-client direction.
 // If UnpartitionS2C() is not called, Finish() must be called.
 func (c *PartitionableConn) PartitionS2C() {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.mu.s2cPartitioned {
 		panic("already partitioned")
 	}
 	c.mu.s2cPartitioned = true
 	c.mu.s2cBuffer.wakeReaderLocked()
-	c.mu.Unlock()
 }
 
 // UnpartitionS2C lifts an existing server-to-client partition.
 func (c *PartitionableConn) UnpartitionS2C() {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	if !c.mu.s2cPartitioned {
 		panic("not partitioned")
 	}
 	c.mu.s2cPartitioned = false
 	c.mu.s2cWaiter.Signal()
-	c.mu.Unlock()
 }
 
 // Read is part of the net.Conn interface.
@@ -390,7 +382,7 @@ func (c *PartitionableConn) copyFromBuffer(
 			}
 		} else if err == nil {
 			err = io.EOF
-		} else if err == errEAgain {
+		} else if errors.Is(err, errEAgain) {
 			continue
 		}
 		if err != nil {

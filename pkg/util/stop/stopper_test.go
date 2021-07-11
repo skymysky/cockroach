@@ -1,37 +1,33 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package stop_test
 
 import (
+	"context"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	_ "github.com/cockroachdb/cockroach/pkg/util/log" // for flags
+	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 )
 
 func TestStopper(t *testing.T) {
@@ -42,7 +38,7 @@ func TestStopper(t *testing.T) {
 	cleanup := make(chan struct{})
 	ctx := context.Background()
 
-	s.RunWorker(ctx, func(context.Context) {
+	_ = s.RunAsyncTask(ctx, "task", func(context.Context) {
 		<-running
 	})
 
@@ -52,9 +48,10 @@ func TestStopper(t *testing.T) {
 		<-cleanup
 	}()
 
-	<-s.ShouldStop()
+	<-s.ShouldQuiesce()
 	select {
 	case <-waiting:
+		close(cleanup)
 		t.Fatal("expected stopper to have blocked")
 	case <-time.After(100 * time.Millisecond):
 		// Expected.
@@ -64,6 +61,7 @@ func TestStopper(t *testing.T) {
 	case <-waiting:
 		// Success.
 	case <-time.After(time.Second):
+		close(cleanup)
 		t.Fatal("stopper should have finished waiting")
 	}
 	close(cleanup)
@@ -93,7 +91,7 @@ func TestStopperIsStopped(t *testing.T) {
 	go s.Stop(context.Background())
 
 	select {
-	case <-s.ShouldStop():
+	case <-s.ShouldQuiesce():
 	case <-time.After(time.Second):
 		t.Fatal("stopper should have finished waiting")
 	}
@@ -110,18 +108,20 @@ func TestStopperIsStopped(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("stopper should have finished stopping")
 	}
+
+	s.Stop(context.Background())
 }
 
-func TestStopperMultipleStopees(t *testing.T) {
+func TestStopperMultipleTasks(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	const count = 3
 	s := stop.NewStopper()
 	ctx := context.Background()
 
 	for i := 0; i < count; i++ {
-		s.RunWorker(ctx, func(context.Context) {
-			<-s.ShouldStop()
-		})
+		require.NoError(t, s.RunAsyncTask(ctx, "task", func(context.Context) {
+			<-s.ShouldQuiesce()
+		}))
 	}
 
 	done := make(chan struct{})
@@ -135,15 +135,17 @@ func TestStopperMultipleStopees(t *testing.T) {
 
 func TestStopperStartFinishTasks(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := stop.NewStopper()
+
 	ctx := context.Background()
+	s := stop.NewStopper()
+	defer s.Stop(ctx)
 
 	if err := s.RunTask(ctx, "test", func(ctx context.Context) {
 		go s.Stop(ctx)
 
 		select {
-		case <-s.ShouldStop():
-			t.Fatal("expected stopper to be quiesceing")
+		case <-s.IsStopped():
+			t.Fatal("stopper not fully stopped")
 		case <-time.After(100 * time.Millisecond):
 			// Expected.
 		}
@@ -151,27 +153,7 @@ func TestStopperStartFinishTasks(t *testing.T) {
 		t.Error(err)
 	}
 	select {
-	case <-s.ShouldStop():
-		// Success.
-	case <-time.After(time.Second):
-		t.Fatal("stopper should be ready to stop")
-	}
-}
-
-func TestStopperRunWorker(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	s := stop.NewStopper()
-	ctx := context.Background()
-	s.RunWorker(ctx, func(context.Context) {
-		<-s.ShouldStop()
-	})
-	closer := make(chan struct{})
-	go func() {
-		s.Stop(ctx)
-		close(closer)
-	}()
-	select {
-	case <-closer:
+	case <-s.IsStopped():
 		// Success.
 	case <-time.After(time.Second):
 		t.Fatal("stopper should be ready to stop")
@@ -195,17 +177,17 @@ func TestStopperQuiesce(t *testing.T) {
 		quiesceDone = append(quiesceDone, qc)
 		sc := make(chan struct{})
 		runTaskDone = append(runTaskDone, sc)
-		thisStopper.RunWorker(ctx, func(ctx context.Context) {
+		go func() {
 			// Wait until Quiesce() is called.
 			<-qc
-			err := thisStopper.RunTask(ctx, "test", func(context.Context) {})
-			if _, ok := err.(*roachpb.NodeUnavailableError); !ok {
+			err := thisStopper.RunTask(ctx, "inner", func(context.Context) {})
+			if !errors.HasType(err, (*roachpb.NodeUnavailableError)(nil)) {
 				t.Error(err)
 			}
 			// Make the stoppers call Stop().
 			close(sc)
-			<-thisStopper.ShouldStop()
-		})
+			<-thisStopper.ShouldQuiesce()
+		}()
 	}
 
 	done := make(chan struct{})
@@ -255,9 +237,39 @@ func TestStopperClosers(t *testing.T) {
 	}
 }
 
+func TestStopperCloserConcurrent(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	const trials = 10
+	for i := 0; i < trials; i++ {
+		s := stop.NewStopper()
+		var tc1 testCloser
+
+		// Add Closer and Stop concurrently. There should be
+		// no circumstance where the Closer is not called.
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			runtime.Gosched()
+			s.AddCloser(&tc1)
+		}()
+		go func() {
+			defer wg.Done()
+			runtime.Gosched()
+			s.Stop(context.Background())
+		}()
+		wg.Wait()
+
+		if !tc1 {
+			t.Errorf("expected true; got %t", tc1)
+		}
+	}
+}
+
 func TestStopperNumTasks(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s := stop.NewStopper()
+	defer s.Stop(context.Background())
 	var tasks []chan bool
 	for i := 0; i < 3; i++ {
 		c := make(chan bool)
@@ -268,30 +280,11 @@ func TestStopperNumTasks(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		tm := s.RunningTasks()
-		if numTypes, numTasks := len(tm), s.NumTasks(); numTypes != 1 || numTasks != i+1 {
-			t.Errorf("stopper should have %d running tasks, got %d / %+v", i+1, numTasks, tm)
-		}
-		m := s.RunningTasks()
-		if len(m) != 1 {
-			t.Fatalf("expected exactly one task map entry: %+v", m)
-		}
-		for _, v := range m {
-			if expNum := len(tasks); v != expNum {
-				t.Fatalf("%d: expected %d tasks, got %d", i, expNum, v)
-			}
+		if numTasks := s.NumTasks(); numTasks != i+1 {
+			t.Errorf("stopper should have %d running tasks, got %d", i+1, numTasks)
 		}
 	}
 	for i, c := range tasks {
-		m := s.RunningTasks()
-		if len(m) != 1 {
-			t.Fatalf("%d: expected exactly one task map entry: %+v", i, m)
-		}
-		for _, v := range m {
-			if expNum := len(tasks[i:]); v != expNum {
-				t.Fatalf("%d: expected %d tasks, got %d:\n%s", i, expNum, v, m)
-			}
-		}
 		// Close the channel to let the task proceed.
 		close(c)
 		expNum := len(tasks[i+1:])
@@ -302,11 +295,6 @@ func TestStopperNumTasks(t *testing.T) {
 			return nil
 		})
 	}
-	// The taskmap should've been cleared out.
-	if m := s.RunningTasks(); len(m) != 0 {
-		t.Fatalf("task map not empty: %+v", m)
-	}
-	s.Stop(context.Background())
 }
 
 // TestStopperRunTaskPanic ensures that a panic handler can recover panicking
@@ -317,6 +305,7 @@ func TestStopperRunTaskPanic(t *testing.T) {
 	s := stop.NewStopper(stop.OnPanic(func(v interface{}) {
 		ch <- v
 	}))
+	defer s.Stop(context.Background())
 	// If RunTask were not panic-safe, Stop() would deadlock.
 	type testFn func()
 	explode := func(context.Context) { panic(ch) }
@@ -331,13 +320,10 @@ func TestStopperRunTaskPanic(t *testing.T) {
 		func() {
 			_ = s.RunLimitedAsyncTask(
 				context.Background(), "test",
-				make(chan struct{}, 1),
+				quotapool.NewIntPool("test", 1),
 				true, /* wait */
 				func(ctx context.Context) { explode(ctx) },
 			)
-		},
-		func() {
-			s.RunWorker(ctx, explode)
 		},
 	} {
 		go test()
@@ -351,28 +337,71 @@ func TestStopperRunTaskPanic(t *testing.T) {
 func TestStopperWithCancel(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s := stop.NewStopper()
-	ctx := s.WithCancel(context.Background())
+	ctx := context.Background()
+	ctx1, _ := s.WithCancelOnQuiesce(ctx)
+	ctx3, cancel3 := s.WithCancelOnQuiesce(ctx)
+
+	if err := ctx1.Err(); err != nil {
+		t.Fatalf("should not be canceled: %v", err)
+	}
+	if err := ctx3.Err(); err != nil {
+		t.Fatalf("should not be canceled: %v", err)
+	}
+
+	cancel3()
+	if err := ctx1.Err(); err != nil {
+		t.Fatalf("should not be canceled: %v", err)
+	}
+	if err := ctx3.Err(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("should be canceled: %v", err)
+	}
+
+	s.Quiesce(ctx)
+	if err := ctx1.Err(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("should be canceled: %v", err)
+	}
+
 	s.Stop(ctx)
-	if err := ctx.Err(); err != context.Canceled {
-		t.Fatal(err)
+}
+
+func TestStopperWithCancelConcurrent(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	const trials = 10
+	for i := 0; i < trials; i++ {
+		s := stop.NewStopper()
+		ctx := context.Background()
+		var ctx1 context.Context
+
+		// Tie a context to the Stopper and Stop concurrently. There should
+		// be no circumstance where either Context is not canceled.
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			runtime.Gosched()
+			ctx1, _ = s.WithCancelOnQuiesce(ctx)
+		}()
+		go func() {
+			defer wg.Done()
+			runtime.Gosched()
+			s.Stop(ctx)
+		}()
+		wg.Wait()
+
+		if err := ctx1.Err(); !errors.Is(err, context.Canceled) {
+			t.Errorf("should be canceled: %v", err)
+		}
 	}
 }
 
 func TestStopperShouldQuiesce(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s := stop.NewStopper()
-	running := make(chan struct{})
 	runningTask := make(chan struct{})
 	waiting := make(chan struct{})
 	cleanup := make(chan struct{})
 	ctx := context.Background()
 
-	// Run a worker. A call to stopper.Stop(context.Background()) will not close until all workers
-	// have completed, and this worker will complete when the "running" channel
-	// is closed.
-	s.RunWorker(ctx, func(context.Context) {
-		<-running
-	})
 	// Run an asynchronous task. A stopper which has been Stop()ed will not
 	// close it's ShouldStop() channel until all tasks have completed. This task
 	// will complete when the "runningTask" channel is closed.
@@ -391,31 +420,15 @@ func TestStopperShouldQuiesce(t *testing.T) {
 	// The ShouldQuiesce() channel should close as soon as the stopper is
 	// Stop()ed.
 	<-s.ShouldQuiesce()
-	// However, the ShouldStop() channel should still be blocked because the
-	// async task started above is still running, meaning we haven't quiesceed
-	// yet.
-	select {
-	case <-s.ShouldStop():
-		t.Fatal("expected ShouldStop() to block until quiesceing complete")
-	default:
-		// Expected.
-	}
 	// After completing the running task, the ShouldStop() channel should
 	// now close.
 	close(runningTask)
-	<-s.ShouldStop()
-	// However, the working running above prevents the call to Stop() from
-	// returning; it blocks until the runner's goroutine is finished. We
-	// use the "waiting" channel to detect this.
 	select {
-	case <-waiting:
-		t.Fatal("expected stopper to have blocked")
-	default:
-		// Expected.
+	case <-s.IsStopped():
+	// Good.
+	case <-time.After(10 * time.Second):
+		t.Fatal("stopper did not fully stop in time")
 	}
-	// Finally, close the "running" channel, which should cause the original
-	// call to Stop() to return.
-	close(running)
 	<-waiting
 	close(cleanup)
 }
@@ -427,7 +440,7 @@ func TestStopperRunLimitedAsyncTask(t *testing.T) {
 
 	const maxConcurrency = 5
 	const numTasks = maxConcurrency * 3
-	sem := make(chan struct{}, maxConcurrency)
+	sem := quotapool.NewIntPool("test", maxConcurrency)
 	taskSignal := make(chan struct{}, maxConcurrency)
 	var mu syncutil.Mutex
 	concurrency := 0
@@ -481,15 +494,39 @@ func TestStopperRunLimitedAsyncTask(t *testing.T) {
 			peakConcurrency, maxConcurrency)
 	}
 
-	sem = make(chan struct{}, 1)
-	sem <- struct{}{}
-	err := s.RunLimitedAsyncTask(
+	sem = quotapool.NewIntPool("test", 1)
+	_, err := sem.Acquire(context.Background(), 1)
+	require.NoError(t, err)
+	err = s.RunLimitedAsyncTask(
 		context.Background(), "test", sem, false /* wait */, func(_ context.Context) {
 		},
 	)
-	if err != stop.ErrThrottled {
+	if !errors.Is(err, stop.ErrThrottled) {
 		t.Fatalf("expected %v; got %v", stop.ErrThrottled, err)
 	}
+}
+
+// This test ensures that if a quotapool has been registered as a Closer for
+// the stopper and the stopper is Quiesced then blocked tasks will return
+// ErrUnavailable.
+func TestStopperRunLimitedAsyncTaskCloser(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	s := stop.NewStopper()
+	defer s.Stop(ctx)
+
+	sem := quotapool.NewIntPool("test", 1)
+	s.AddCloser(sem.Closer("stopper"))
+	_, err := sem.Acquire(ctx, 1)
+	require.NoError(t, err)
+	go func() {
+		time.Sleep(time.Millisecond)
+		s.Stop(ctx)
+	}()
+	err = s.RunLimitedAsyncTask(ctx, "foo", sem, true /* wait */, func(context.Context) {})
+	require.Equal(t, stop.ErrUnavailable, err)
+	<-s.IsStopped()
 }
 
 func TestStopperRunLimitedAsyncTaskCancelContext(t *testing.T) {
@@ -498,14 +535,14 @@ func TestStopperRunLimitedAsyncTaskCancelContext(t *testing.T) {
 	defer s.Stop(context.Background())
 
 	const maxConcurrency = 5
-	sem := make(chan struct{}, maxConcurrency)
+	sem := quotapool.NewIntPool("test", maxConcurrency)
 
 	// Synchronization channels.
 	workersDone := make(chan struct{})
 	workerStarted := make(chan struct{})
 
 	var workersRun int32
-	var workersCancelled int32
+	var workersCanceled int32
 
 	ctx, cancel := context.WithCancel(context.Background())
 	f := func(ctx context.Context) {
@@ -518,10 +555,10 @@ func TestStopperRunLimitedAsyncTaskCancelContext(t *testing.T) {
 	if err := s.RunAsyncTask(ctx, "test", func(ctx context.Context) {
 		for i := 0; i < maxConcurrency*2; i++ {
 			if err := s.RunLimitedAsyncTask(ctx, "test", sem, true, f); err != nil {
-				if err != context.Canceled {
+				if !errors.Is(err, context.Canceled) {
 					t.Fatal(err)
 				}
-				atomic.AddInt32(&workersCancelled, 1)
+				atomic.AddInt32(&workersCanceled, 1)
 			}
 		}
 		close(workersDone)
@@ -543,8 +580,8 @@ func TestStopperRunLimitedAsyncTaskCancelContext(t *testing.T) {
 	if a, e := atomic.LoadInt32(&workersRun), int32(maxConcurrency); a != e {
 		t.Fatalf("%d workers ran before context close, expected exactly %d", a, e)
 	}
-	if a, e := atomic.LoadInt32(&workersCancelled), int32(maxConcurrency); a != e {
-		t.Fatalf("%d workers cancelled after context close, expected exactly %d", a, e)
+	if a, e := atomic.LoadInt32(&workersCanceled), int32(maxConcurrency); a != e {
+		t.Fatalf("%d workers canceled after context close, expected exactly %d", a, e)
 	}
 }
 
@@ -555,7 +592,7 @@ func maybePrint(context.Context) {
 }
 
 func BenchmarkDirectCall(b *testing.B) {
-	defer leaktest.AfterTest(b)
+	defer leaktest.AfterTest(b)()
 	s := stop.NewStopper()
 	ctx := context.Background()
 	defer s.Stop(ctx)
@@ -565,7 +602,7 @@ func BenchmarkDirectCall(b *testing.B) {
 }
 
 func BenchmarkStopper(b *testing.B) {
-	defer leaktest.AfterTest(b)
+	defer leaktest.AfterTest(b)()
 	ctx := context.Background()
 	s := stop.NewStopper()
 	defer s.Stop(ctx)
@@ -576,7 +613,7 @@ func BenchmarkStopper(b *testing.B) {
 	}
 }
 func BenchmarkDirectCallPar(b *testing.B) {
-	defer leaktest.AfterTest(b)
+	defer leaktest.AfterTest(b)()
 	s := stop.NewStopper()
 	ctx := context.Background()
 	defer s.Stop(ctx)
@@ -588,7 +625,7 @@ func BenchmarkDirectCallPar(b *testing.B) {
 }
 
 func BenchmarkStopperPar(b *testing.B) {
-	defer leaktest.AfterTest(b)
+	defer leaktest.AfterTest(b)()
 	ctx := context.Background()
 	s := stop.NewStopper()
 	defer s.Stop(ctx)
@@ -600,3 +637,21 @@ func BenchmarkStopperPar(b *testing.B) {
 		}
 	})
 }
+
+func TestCancelInCloser(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+	s := stop.NewStopper()
+	defer s.Stop(ctx)
+
+	// This will call the Closer which will call cancel and should
+	// not deadlock.
+	_, cancel := s.WithCancelOnQuiesce(ctx)
+	s.AddCloser(closerFunc(cancel))
+	s.Stop(ctx)
+}
+
+// closerFunc implements Closer.
+type closerFunc func()
+
+func (cf closerFunc) Close() { cf() }

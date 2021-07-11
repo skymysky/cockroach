@@ -1,185 +1,184 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server_test
 
 import (
-	gosql "database/sql"
+	"context"
 	"fmt"
-	"net/url"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 const strKey = "testing.str"
-const intKey = `testing.int`
+const intKey = "testing.int"
 const durationKey = "testing.duration"
 const byteSizeKey = "testing.bytesize"
 const enumKey = "testing.enum"
 
-var strA = settings.RegisterValidatedStringSetting(strKey, "", "<default>", func(v string) error {
+var strA = settings.RegisterValidatedStringSetting(strKey, "desc", "<default>", func(sv *settings.Values, v string) error {
 	if len(v) > 15 {
 		return errors.Errorf("can't set %s to string longer than 15: %s", strKey, v)
 	}
 	return nil
 })
-var intA = settings.RegisterValidatedIntSetting(intKey, "", 1, func(v int64) error {
+var intA = settings.RegisterIntSetting(intKey, "desc", 1, func(v int64) error {
 	if v < 0 {
 		return errors.Errorf("can't set %s to a negative value: %d", intKey, v)
 	}
 	return nil
 
 })
-var durationA = settings.RegisterValidatedDurationSetting(durationKey, "", time.Minute, func(v time.Duration) error {
+var durationA = settings.RegisterDurationSetting(durationKey, "desc", time.Minute, func(v time.Duration) error {
 	if v < 0 {
 		return errors.Errorf("can't set %s to a negative duration: %s", durationKey, v)
 	}
 	return nil
 })
-var byteSizeA = settings.RegisterValidatedByteSizeSetting(byteSizeKey, "", 1024*1024, func(v int64) error {
+var byteSizeA = settings.RegisterByteSizeSetting(byteSizeKey, "desc", 1024*1024, func(v int64) error {
 	if v < 0 {
 		return errors.Errorf("can't set %s to a negative value: %d", byteSizeKey, v)
 	}
 	return nil
 })
-var enumA = settings.RegisterEnumSetting(enumKey, "", "foo", map[int64]string{1: "foo", 2: "bar"})
+var enumA = settings.RegisterEnumSetting(enumKey, "desc", "foo", map[int64]string{1: "foo", 2: "bar"})
 
 func TestSettingsRefresh(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	s, rawDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	// Set up some additional cluster settings to play around with. Note that we
+	// need to do this before starting the server, or there will be data races.
+	st := cluster.MakeTestingClusterSettings()
+	s, rawDB, _ := serverutils.StartServer(t, base.TestServerArgs{Settings: st})
+	defer s.Stopper().Stop(context.Background())
 
-	db := sqlutils.MakeSQLRunner(t, rawDB)
+	db := sqlutils.MakeSQLRunner(rawDB)
 
-	insertQ := `UPSERT INTO system.settings (name, value, lastUpdated, valueType)
-		VALUES ($1, $2, NOW(), $3)`
+	insertQ := `UPSERT INTO system.settings (name, value, "lastUpdated", "valueType")
+		VALUES ($1, $2, now(), $3)`
 	deleteQ := "DELETE FROM system.settings WHERE name = $1"
 
-	if expected, actual := "<default>", strA.Get(); expected != actual {
+	if expected, actual := "<default>", strA.Get(&st.SV); expected != actual {
 		t.Fatalf("expected %v, got %v", expected, actual)
 	}
-	if expected, actual := int64(1), intA.Get(); expected != actual {
+	if expected, actual := int64(1), intA.Get(&st.SV); expected != actual {
 		t.Fatalf("expected %v, got %v", expected, actual)
 	}
 
 	// Inserting a new setting is reflected in cache.
-	db.Exec(insertQ, strKey, "foo", "s")
-	db.Exec(insertQ, intKey, settings.EncodeInt(2), "i")
+	db.Exec(t, insertQ, strKey, "foo", "s")
+	db.Exec(t, insertQ, intKey, settings.EncodeInt(2), "i")
 	// Wait until we observe the gossip-driven update propagating to cache.
 	testutils.SucceedsSoon(t, func() error {
-		if expected, actual := "foo", strA.Get(); expected != actual {
+		if expected, actual := "foo", strA.Get(&st.SV); expected != actual {
 			return errors.Errorf("expected %v, got %v", expected, actual)
 		}
-		if expected, actual := int64(2), intA.Get(); expected != actual {
+		if expected, actual := int64(2), intA.Get(&st.SV); expected != actual {
 			return errors.Errorf("expected %v, got %v", expected, actual)
 		}
 		return nil
 	})
 
 	// Setting to empty also works.
-	db.Exec(insertQ, strKey, "", "s")
+	db.Exec(t, insertQ, strKey, "", "s")
 	testutils.SucceedsSoon(t, func() error {
-		if expected, actual := "", strA.Get(); expected != actual {
+		if expected, actual := "", strA.Get(&st.SV); expected != actual {
 			return errors.Errorf("expected %v, got %v", expected, actual)
 		}
 		return nil
 	})
 
 	// An unknown value doesn't block updates to a known one.
-	db.Exec(insertQ, "dne", "???", "s")
-	db.Exec(insertQ, strKey, "qux", "s")
+	db.Exec(t, insertQ, "dne", "???", "s")
+	db.Exec(t, insertQ, strKey, "qux", "s")
 
 	testutils.SucceedsSoon(t, func() error {
-		if expected, actual := "qux", strA.Get(); expected != actual {
+		if expected, actual := "qux", strA.Get(&st.SV); expected != actual {
 			return errors.Errorf("expected %v, got %v", expected, actual)
 		}
-		if expected, actual := int64(2), intA.Get(); expected != actual {
+		if expected, actual := int64(2), intA.Get(&st.SV); expected != actual {
 			return errors.Errorf("expected %v, got %v", expected, actual)
 		}
 		return nil
 	})
 
 	// A malformed value doesn't revert previous set or block other changes.
-	db.Exec(deleteQ, "dne")
-	db.Exec(insertQ, intKey, "invalid", "i")
-	db.Exec(insertQ, strKey, "after-invalid", "s")
+	db.Exec(t, deleteQ, "dne")
+	db.Exec(t, insertQ, intKey, "invalid", "i")
+	db.Exec(t, insertQ, strKey, "after-invalid", "s")
 
 	testutils.SucceedsSoon(t, func() error {
-		if expected, actual := int64(2), intA.Get(); expected != actual {
+		if expected, actual := int64(2), intA.Get(&st.SV); expected != actual {
 			return errors.Errorf("expected %v, got %v", expected, actual)
 		}
-		if expected, actual := "after-invalid", strA.Get(); expected != actual {
+		if expected, actual := "after-invalid", strA.Get(&st.SV); expected != actual {
 			return errors.Errorf("expected %v, got %v", expected, actual)
 		}
 		return nil
 	})
 
 	// A mis-typed value doesn't revert a previous set or block other changes.
-	db.Exec(insertQ, intKey, settings.EncodeInt(7), "b")
-	db.Exec(insertQ, strKey, "after-mistype", "s")
+	db.Exec(t, insertQ, intKey, settings.EncodeInt(7), "b")
+	db.Exec(t, insertQ, strKey, "after-mistype", "s")
 
 	testutils.SucceedsSoon(t, func() error {
-		if expected, actual := int64(2), intA.Get(); expected != actual {
+		if expected, actual := int64(2), intA.Get(&st.SV); expected != actual {
 			return errors.Errorf("expected %v, got %v", expected, actual)
 		}
-		if expected, actual := "after-mistype", strA.Get(); expected != actual {
+		if expected, actual := "after-mistype", strA.Get(&st.SV); expected != actual {
 			return errors.Errorf("expected %v, got %v", expected, actual)
 		}
 		return nil
 	})
 
 	// An invalid value doesn't revert a previous set or block other changes.
-	prevStrA := strA.Get()
-	prevIntA := intA.Get()
-	prevDurationA := durationA.Get()
-	prevByteSizeA := byteSizeA.Get()
-	db.Exec(insertQ, strKey, "this is too big for this setting", "s")
-	db.Exec(insertQ, intKey, settings.EncodeInt(-1), "i")
-	db.Exec(insertQ, durationKey, settings.EncodeDuration(-time.Minute), "d")
-	db.Exec(insertQ, byteSizeKey, settings.EncodeInt(-1), "z")
+	prevStrA := strA.Get(&st.SV)
+	prevIntA := intA.Get(&st.SV)
+	prevDurationA := durationA.Get(&st.SV)
+	prevByteSizeA := byteSizeA.Get(&st.SV)
+	db.Exec(t, insertQ, strKey, "this is too big for this setting", "s")
+	db.Exec(t, insertQ, intKey, settings.EncodeInt(-1), "i")
+	db.Exec(t, insertQ, durationKey, settings.EncodeDuration(-time.Minute), "d")
+	db.Exec(t, insertQ, byteSizeKey, settings.EncodeInt(-1), "z")
 
 	testutils.SucceedsSoon(t, func() error {
-		if expected, actual := prevStrA, strA.Get(); expected != actual {
+		if expected, actual := prevStrA, strA.Get(&st.SV); expected != actual {
 			return errors.Errorf("expected %v, got %v", expected, actual)
 		}
-		if expected, actual := prevIntA, intA.Get(); expected != actual {
+		if expected, actual := prevIntA, intA.Get(&st.SV); expected != actual {
 			return errors.Errorf("expected %v, got %v", expected, actual)
 		}
-		if expected, actual := prevDurationA, durationA.Get(); expected != actual {
+		if expected, actual := prevDurationA, durationA.Get(&st.SV); expected != actual {
 			return errors.Errorf("expected %v, got %v", expected, actual)
 		}
-		if expected, actual := prevByteSizeA, byteSizeA.Get(); expected != actual {
+		if expected, actual := prevByteSizeA, byteSizeA.Get(&st.SV); expected != actual {
 			return errors.Errorf("expected %v, got %v", expected, actual)
 		}
 		return nil
 	})
 
 	// Deleting a value reverts to default.
-	db.Exec(deleteQ, strKey)
+	db.Exec(t, deleteQ, strKey)
 	testutils.SucceedsSoon(t, func() error {
-		if expected, actual := "<default>", strA.Get(); expected != actual {
+		if expected, actual := "<default>", strA.Get(&st.SV); expected != actual {
 			return errors.Errorf("expected %v, got %v", expected, actual)
 		}
 		return nil
@@ -189,132 +188,96 @@ func TestSettingsRefresh(t *testing.T) {
 
 func TestSettingsSetAndShow(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	// Set up some additional cluster settings to play around with. Note that we
+	// need to do this before starting the server, or there will be data races.
+	st := cluster.MakeTestingClusterSettings()
+	s, rawDB, _ := serverutils.StartServer(t, base.TestServerArgs{Settings: st})
+	defer s.Stopper().Stop(context.Background())
 
-	s, rawDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
-
-	db := sqlutils.MakeSQLRunner(t, rawDB)
+	db := sqlutils.MakeSQLRunner(rawDB)
 
 	// TODO(dt): add placeholder support to SET and SHOW.
 	setQ := `SET CLUSTER SETTING "%s" = %s`
 	showQ := `SHOW CLUSTER SETTING "%s"`
 
-	db.Exec(fmt.Sprintf(setQ, strKey, "'via-set'"))
-	testutils.SucceedsSoon(t, func() error {
-		if expected, actual := "via-set", db.QueryStr(fmt.Sprintf(showQ, strKey))[0][0]; expected != actual {
-			return errors.Errorf("expected %v, got %v", expected, actual)
-		}
-		return nil
-	})
-
-	db.Exec(fmt.Sprintf(setQ, intKey, "5"))
-	testutils.SucceedsSoon(t, func() error {
-		if expected, actual := "5", db.QueryStr(fmt.Sprintf(showQ, intKey))[0][0]; expected != actual {
-			return errors.Errorf("expected %v, got %v", expected, actual)
-		}
-		return nil
-	})
-
-	db.Exec(fmt.Sprintf(setQ, durationKey, "'2h'"))
-	testutils.SucceedsSoon(t, func() error {
-		if expected, actual := time.Hour*2, durationA.Get(); expected != actual {
-			return errors.Errorf("expected %v, got %v", expected, actual)
-		}
-		if expected, actual := "2h", db.QueryStr(fmt.Sprintf(showQ, durationKey))[0][0]; expected != actual {
-			return errors.Errorf("expected %v, got %v", expected, actual)
-		}
-		return nil
-	})
-
-	db.Exec(fmt.Sprintf(setQ, byteSizeKey, "'1500MB'"))
-	testutils.SucceedsSoon(t, func() error {
-		if expected, actual := int64(1500000000), byteSizeA.Get(); expected != actual {
-			return errors.Errorf("expected %v, got %v", expected, actual)
-		}
-		if expected, actual := "1.4 GiB", db.QueryStr(fmt.Sprintf(showQ, byteSizeKey))[0][0]; expected != actual {
-			return errors.Errorf("expected %v, got %v", expected, actual)
-		}
-		return nil
-	})
-
-	db.Exec(fmt.Sprintf(setQ, byteSizeKey, "'1450MB'"))
-	testutils.SucceedsSoon(t, func() error {
-		if expected, actual := "1.4 GiB", db.QueryStr(fmt.Sprintf(showQ, byteSizeKey))[0][0]; expected != actual {
-			return errors.Errorf("expected %v, got %v", expected, actual)
-		}
-		return nil
-	})
-
-	if _, err := db.DB.Exec(fmt.Sprintf(setQ, intKey, "'a-str'")); !testutils.IsError(
-		err, fmt.Sprintf(`argument of %s must be type int, not type string`, intKey),
-	) {
-		t.Fatal(err)
+	db.Exec(t, fmt.Sprintf(setQ, strKey, "'via-set'"))
+	if expected, actual := "via-set", db.QueryStr(t, fmt.Sprintf(showQ, strKey))[0][0]; expected != actual {
+		t.Fatalf("expected %v, got %v", expected, actual)
 	}
 
-	db.Exec(fmt.Sprintf(setQ, enumKey, "2"))
-	testutils.SucceedsSoon(t, func() error {
-		if expected, actual := int64(2), enumA.Get(); expected != actual {
-			return errors.Errorf("expected %v, got %v", expected, actual)
-		}
-		if expected, actual := "2", db.QueryStr(fmt.Sprintf(showQ, enumKey))[0][0]; expected != actual {
-			return errors.Errorf("expected %v, got %v", expected, actual)
-		}
-		return nil
-	})
-
-	db.Exec(fmt.Sprintf(setQ, enumKey, "'foo'"))
-	testutils.SucceedsSoon(t, func() error {
-		if expected, actual := int64(1), enumA.Get(); expected != actual {
-			return errors.Errorf("expected %v, got %v", expected, actual)
-		}
-		if expected, actual := "1", db.QueryStr(fmt.Sprintf(showQ, enumKey))[0][0]; expected != actual {
-			return errors.Errorf("expected %v, got %v", expected, actual)
-		}
-		return nil
-	})
-
-	if _, err := db.DB.Exec(fmt.Sprintf(setQ, enumKey, "'unknown'")); !testutils.IsError(err,
-		`invalid string value 'unknown' for enum setting`,
-	) {
-		t.Fatal(err)
+	db.Exec(t, fmt.Sprintf(setQ, intKey, "5"))
+	if expected, actual := "5", db.QueryStr(t, fmt.Sprintf(showQ, intKey))[0][0]; expected != actual {
+		t.Fatalf("expected %v, got %v", expected, actual)
 	}
 
-	if _, err := db.DB.Exec(fmt.Sprintf(setQ, enumKey, "7")); !testutils.IsError(err,
-		`invalid integer value '7' for enum setting`,
-	) {
-		t.Fatal(err)
+	db.Exec(t, fmt.Sprintf(setQ, durationKey, "'2h'"))
+	if expected, actual := time.Hour*2, durationA.Get(&st.SV); expected != actual {
+		t.Fatalf("expected %v, got %v", expected, actual)
+	}
+	if expected, actual := "02:00:00", db.QueryStr(t, fmt.Sprintf(showQ, durationKey))[0][0]; expected != actual {
+		t.Fatalf("expected %v, got %v", expected, actual)
 	}
 
-	db.Exec(`CREATE USER testuser`)
-	pgURL, cleanupFunc := sqlutils.PGUrl(t, s.ServingAddr(), t.Name(), url.User("testuser"))
-	defer cleanupFunc()
-	testuser, err := gosql.Open("postgres", pgURL.String())
-	if err != nil {
-		t.Fatal(err)
+	db.Exec(t, fmt.Sprintf(setQ, byteSizeKey, "'1500MB'"))
+	if expected, actual := int64(1500000000), byteSizeA.Get(&st.SV); expected != actual {
+		t.Fatalf("expected %v, got %v", expected, actual)
 	}
-	defer testuser.Close()
+	if expected, actual := "1.4 GiB", db.QueryStr(t, fmt.Sprintf(showQ, byteSizeKey))[0][0]; expected != actual {
+		t.Fatalf("expected %v, got %v", expected, actual)
+	}
 
-	if _, err := testuser.Exec(`SET CLUSTER SETTING foo = 'bar'`); !testutils.IsError(err,
-		`only root is allowed to SET CLUSTER SETTING`,
-	) {
-		t.Fatal(err)
+	db.Exec(t, fmt.Sprintf(setQ, byteSizeKey, "'1450MB'"))
+	if expected, actual := "1.4 GiB", db.QueryStr(t, fmt.Sprintf(showQ, byteSizeKey))[0][0]; expected != actual {
+		t.Fatalf("expected %v, got %v", expected, actual)
 	}
+
+	db.ExpectErr(t, `could not parse "a-str" as type int`, fmt.Sprintf(setQ, intKey, "'a-str'"))
+
+	db.Exec(t, fmt.Sprintf(setQ, enumKey, "2"))
+	if expected, actual := int64(2), enumA.Get(&st.SV); expected != actual {
+		t.Fatalf("expected %v, got %v", expected, actual)
+	}
+	if expected, actual := "bar", db.QueryStr(t, fmt.Sprintf(showQ, enumKey))[0][0]; expected != actual {
+		t.Fatalf("expected %v, got %v", expected, actual)
+	}
+
+	db.Exec(t, fmt.Sprintf(setQ, enumKey, "'foo'"))
+	if expected, actual := int64(1), enumA.Get(&st.SV); expected != actual {
+		t.Fatalf("expected %v, got %v", expected, actual)
+	}
+	if expected, actual := "foo", db.QueryStr(t, fmt.Sprintf(showQ, enumKey))[0][0]; expected != actual {
+		t.Fatalf("expected %v, got %v", expected, actual)
+	}
+
+	db.ExpectErr(
+		t, `invalid string value 'unknown' for enum setting`,
+		fmt.Sprintf(setQ, enumKey, "'unknown'"),
+	)
+
+	db.ExpectErr(t, `invalid integer value '7' for enum setting`, fmt.Sprintf(setQ, enumKey, "7"))
 }
 
 func TestSettingsShowAll(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	s, rawDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	// Set up some additional cluster settings to play around with. Note that we
+	// need to do this before starting the server, or there will be data races.
+	st := cluster.MakeTestingClusterSettings()
 
-	db := sqlutils.MakeSQLRunner(t, rawDB)
+	s, rawDB, _ := serverutils.StartServer(t, base.TestServerArgs{Settings: st})
+	defer s.Stopper().Stop(context.Background())
 
-	rows := db.QueryStr("SHOW ALL CLUSTER SETTINGS")
+	db := sqlutils.MakeSQLRunner(rawDB)
+
+	rows := db.QueryStr(t, "SHOW ALL CLUSTER SETTINGS")
 	if len(rows) < 2 {
 		t.Fatalf("show all returned too few rows (%d)", len(rows))
 	}
-	if len(rows[0]) != 4 {
-		t.Fatalf("show all must return 4 columns, found %d", len(rows[0]))
+	const expColumns = 5
+	if len(rows[0]) != expColumns {
+		t.Fatalf("show all must return %d columns, found %d", expColumns, len(rows[0]))
 	}
 	hasIntKey := false
 	hasStrKey := false

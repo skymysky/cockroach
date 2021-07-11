@@ -1,23 +1,19 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package settings
 
 import (
-	"sync/atomic"
+	"context"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // IntSetting is the interface of a setting variable that will be
@@ -26,25 +22,42 @@ import (
 type IntSetting struct {
 	common
 	defaultValue int64
-	v            int64
 	validateFn   func(int64) error
 }
 
-var _ Setting = &IntSetting{}
+var _ extendedSetting = &IntSetting{}
 
 // Get retrieves the int value in the setting.
-func (i *IntSetting) Get() int64 {
-	return atomic.LoadInt64(&i.v)
+func (i *IntSetting) Get(sv *Values) int64 {
+	return sv.container.getInt64(i.slotIdx)
 }
 
-func (i *IntSetting) String() string {
-	return EncodeInt(i.Get())
+func (i *IntSetting) String(sv *Values) string {
+	return EncodeInt(i.Get(sv))
+}
+
+// Encoded returns the encoded value of the current value of the setting.
+func (i *IntSetting) Encoded(sv *Values) string {
+	return i.String(sv)
+}
+
+// EncodedDefault returns the encoded value of the default value of the setting.
+func (i *IntSetting) EncodedDefault() string {
+	return EncodeInt(i.defaultValue)
 }
 
 // Typ returns the short (1 char) string denoting the type of setting.
 func (*IntSetting) Typ() string {
 	return "i"
 }
+
+// Default returns default value for setting.
+func (i *IntSetting) Default() int64 {
+	return i.defaultValue
+}
+
+// Defeat the linter.
+var _ = (*IntSetting).Default
 
 // Validate that a value conforms with the validation function.
 func (i *IntSetting) Validate(v int64) error {
@@ -56,57 +69,93 @@ func (i *IntSetting) Validate(v int64) error {
 	return nil
 }
 
-func (i *IntSetting) set(v int64) error {
+// Override changes the setting without validation and also overrides the
+// default value.
+//
+// For testing usage only.
+func (i *IntSetting) Override(ctx context.Context, sv *Values, v int64) {
+	sv.setInt64(ctx, i.slotIdx, v)
+	sv.setDefaultOverrideInt64(i.slotIdx, v)
+}
+
+func (i *IntSetting) set(ctx context.Context, sv *Values, v int64) error {
 	if err := i.Validate(v); err != nil {
 		return err
 	}
-	if atomic.SwapInt64(&i.v, v) != v {
-		i.changed()
-	}
+	sv.setInt64(ctx, i.slotIdx, v)
 	return nil
 }
 
-func (i *IntSetting) setToDefault() {
-	if err := i.set(i.defaultValue); err != nil {
+func (i *IntSetting) setToDefault(ctx context.Context, sv *Values) {
+	// See if the default value was overridden.
+	ok, val, _ := sv.getDefaultOverride(i.slotIdx)
+	if ok {
+		// As per the semantics of override, these values don't go through
+		// validation.
+		_ = i.set(ctx, sv, val)
+		return
+	}
+	if err := i.set(ctx, sv, i.defaultValue); err != nil {
 		panic(err)
 	}
 }
 
-// RegisterIntSetting defines a new setting with type int.
-func RegisterIntSetting(key, desc string, defaultValue int64) *IntSetting {
-	return RegisterValidatedIntSetting(key, desc, defaultValue, nil)
-}
-
-// RegisterValidatedIntSetting defines a new setting with type int with a
+// RegisterIntSetting defines a new setting with type int with a
 // validation function.
-func RegisterValidatedIntSetting(
-	key, desc string, defaultValue int64, validateFn func(int64) error,
+func RegisterIntSetting(
+	key, desc string, defaultValue int64, validateFns ...func(int64) error,
 ) *IntSetting {
-	if validateFn != nil {
-		if err := validateFn(defaultValue); err != nil {
+	var composed func(int64) error
+	if len(validateFns) > 0 {
+		composed = func(v int64) error {
+			for _, validateFn := range validateFns {
+				if err := validateFn(v); err != nil {
+					return errors.Wrapf(err, "invalid value for %s", key)
+				}
+			}
+			return nil
+		}
+	}
+	if composed != nil {
+		if err := composed(defaultValue); err != nil {
 			panic(errors.Wrap(err, "invalid default"))
 		}
 	}
 	setting := &IntSetting{
 		defaultValue: defaultValue,
-		validateFn:   validateFn,
+		validateFn:   composed,
 	}
 	register(key, desc, setting)
 	return setting
 }
 
-// TestingSetInt returns a mock, unregistered int setting for testing. See
-// TestingSetBool for more details.
-func TestingSetInt(s **IntSetting, v int64) func() {
-	saved := *s
-	*s = &IntSetting{v: v}
-	return func() {
-		*s = saved
-	}
+// WithPublic sets public visibility and can be chained.
+func (i *IntSetting) WithPublic() *IntSetting {
+	i.SetVisibility(Public)
+	return i
 }
 
-// OnChange registers a callback to be called when the setting changes.
-func (i *IntSetting) OnChange(fn func()) *IntSetting {
-	i.setOnChange(fn)
+// WithSystemOnly system-only usage and can be chained.
+func (i *IntSetting) WithSystemOnly() *IntSetting {
+	i.common.systemOnly = true
 	return i
+}
+
+// Defeat the linter.
+var _ = (*IntSetting).WithSystemOnly
+
+// PositiveInt can be passed to RegisterIntSetting
+func PositiveInt(v int64) error {
+	if v < 1 {
+		return errors.Errorf("cannot be set to a non-positive value: %d", v)
+	}
+	return nil
+}
+
+// NonNegativeInt can be passed to RegisterIntSetting.
+func NonNegativeInt(v int64) error {
+	if v < 0 {
+		return errors.Errorf("cannot be set to a negative value: %d", v)
+	}
+	return nil
 }

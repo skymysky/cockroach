@@ -1,27 +1,24 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package retry
 
 import (
+	"context"
 	"math"
 	"math/rand"
 	"time"
 
-	"golang.org/x/net/context"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 )
 
 // Options provides reusable configuration of Retry objects.
@@ -31,7 +28,7 @@ type Options struct {
 	Multiplier          float64         // Default backoff constant
 	MaxRetries          int             // Maximum number of attempts (0 for infinite)
 	RandomizationFactor float64         // Randomize the backoff interval by constant
-	Closer              <-chan struct{} // Optionally end retry loop channel close.
+	Closer              <-chan struct{} // Optionally end retry loop channel close
 }
 
 // Retry implements the public methods necessary to control an exponential-
@@ -46,12 +43,13 @@ type Retry struct {
 // Start returns a new Retry initialized to some default values. The Retry can
 // then be used in an exponential-backoff retry loop.
 func Start(opts Options) Retry {
-	return StartWithCtx(nil, opts)
+	return StartWithCtx(context.Background(), opts)
 }
 
 // StartWithCtx returns a new Retry initialized to some default values. The
 // Retry can then be used in an exponential-backoff retry loop. If the provided
-// context is canceled (see Context.Done), the retry loop ends early.
+// context is canceled (see Context.Done), the retry loop ends early, but will
+// always run at least once.
 func StartWithCtx(ctx context.Context, opts Options) Retry {
 	if opts.InitialBackoff == 0 {
 		opts.InitialBackoff = 50 * time.Millisecond
@@ -66,28 +64,31 @@ func StartWithCtx(ctx context.Context, opts Options) Retry {
 		opts.Multiplier = 2
 	}
 
-	r := Retry{opts: opts}
-	if ctx != nil {
-		r.ctxDoneChan = ctx.Done()
-	}
-	r.Reset()
+	var r Retry
+	r.opts = opts
+	r.ctxDoneChan = ctx.Done()
+	r.mustReset()
 	return r
 }
 
 // Reset resets the Retry to its initial state, meaning that the next call to
-// Next will return true immediately and subsequent calls will behave as if
-// they had followed the very first attempt (i.e. their backoffs will be
-// short).
+// Next will return true immediately and subsequent calls will behave as if they
+// had followed the very first attempt (i.e. their backoffs will be short). The
+// exception to this is if the provided Closer has fired or context has been
+// canceled, in which case subsequent calls to Next will still return false
+// immediately.
 func (r *Retry) Reset() {
 	select {
 	case <-r.opts.Closer:
 		// When the closer has fired, you can't keep going.
-		return
 	case <-r.ctxDoneChan:
 		// When the context was canceled, you can't keep going.
-		return
 	default:
+		r.mustReset()
 	}
+}
+
+func (r *Retry) mustReset() {
 	r.currentAttempt = 0
 	r.isReset = true
 }
@@ -106,8 +107,13 @@ func (r Retry) retryIn() time.Duration {
 }
 
 // Next returns whether the retry loop should continue, and blocks for the
-// appropriate length of time before yielding back to the caller. If a stopper
-// is present, Next will eagerly return false when the stopper is stopped.
+// appropriate length of time before yielding back to the caller.
+//
+// Next is guaranteed to return true on its first call. As such, a retry loop
+// can be thought of as implementing do-while semantics (i.e. always running at
+// least once). Otherwide, if a context and/or closer is present, Next will
+// return false if the context is canceled and/or the closer fires while the
+// method is waiting.
 func (r *Retry) Next() bool {
 	if r.isReset {
 		r.isReset = false
@@ -130,11 +136,20 @@ func (r *Retry) Next() bool {
 	}
 }
 
+// closedC is returned from Retry.NextCh whenever a retry
+// can begin immediately.
+var closedC = func() chan time.Time {
+	c := make(chan time.Time)
+	close(c)
+	return c
+}()
+
 // NextCh returns a channel which will receive when the next retry
 // interval has expired.
 func (r *Retry) NextCh() <-chan time.Time {
 	if r.isReset {
 		r.isReset = false
+		return closedC
 	}
 	r.currentAttempt++
 	if r.opts.MaxRetries > 0 && r.currentAttempt > r.opts.MaxRetries {
@@ -144,7 +159,13 @@ func (r *Retry) NextCh() <-chan time.Time {
 }
 
 // WithMaxAttempts is a helper that runs fn N times and collects the last err.
+// The function will terminate early if the provided context is canceled, but it
+// guarantees that fn will run at least once.
 func WithMaxAttempts(ctx context.Context, opts Options, n int, fn func() error) error {
+	if n <= 0 {
+		return errors.Errorf("max attempts should not be 0 or below, got: %d", n)
+	}
+
 	opts.MaxRetries = n - 1
 	var err error
 	for r := StartWithCtx(ctx, opts); r.Next(); {
@@ -153,5 +174,34 @@ func WithMaxAttempts(ctx context.Context, opts Options, n int, fn func() error) 
 			return nil
 		}
 	}
+	if err == nil {
+		log.Fatal(ctx, "never ran function in WithMaxAttempts")
+	}
 	return err
+}
+
+// ForDuration will retry the given function until it either returns
+// without error, or the given duration has elapsed. The function is invoked
+// immediately at first and then successively with an exponential backoff
+// starting at 1ns and ending at the specified duration.
+//
+// This function is DEPRECATED! Please use one of the other functions in this
+// package that takes context cancellation into account.
+//
+// TODO(benesch): remove this function and port its callers to a context-
+// sensitive API.
+func ForDuration(duration time.Duration, fn func() error) error {
+	deadline := timeutil.Now().Add(duration)
+	var lastErr error
+	for wait := time.Duration(1); timeutil.Now().Before(deadline); wait *= 2 {
+		lastErr = fn()
+		if lastErr == nil {
+			return nil
+		}
+		if wait > time.Second {
+			wait = time.Second
+		}
+		time.Sleep(wait)
+	}
+	return lastErr
 }

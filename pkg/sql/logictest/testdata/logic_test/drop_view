@@ -1,5 +1,3 @@
-# LogicTest: default
-
 statement ok
 CREATE TABLE a (k STRING PRIMARY KEY, v STRING)
 
@@ -12,49 +10,49 @@ CREATE VIEW b AS SELECT k,v from a
 statement ok
 CREATE VIEW c AS SELECT k,v from b
 
-query T
+query TTTTIT
 SHOW TABLES FROM test
 ----
-a
-b
-c
+public  a  table  root  0  NULL
+public  b  view   root  0  NULL
+public  c  view   root  0  NULL
 
-statement error cannot drop table "a" because view "b" depends on it
+statement error cannot drop relation "a" because view "b" depends on it
 DROP TABLE a
 
 statement error pgcode 42809 "b" is not a table
 DROP TABLE b
 
-statement error cannot drop view "b" because view "c" depends on it
+statement error cannot drop relation "b" because view "c" depends on it
 DROP VIEW b
 
 statement ok
 CREATE VIEW d AS SELECT k,v FROM a
 
 statement ok
-CREATE VIEW diamond AS SELECT COUNT(*) FROM b AS b JOIN d AS d ON b.k = d.k
+CREATE VIEW diamond AS SELECT count(*) FROM b AS b JOIN d AS d ON b.k = d.k
 
-statement error cannot drop view "d" because view "diamond" depends on it
+statement error cannot drop relation "d" because view "diamond" depends on it
 DROP VIEW d
 
 statement ok
 GRANT ALL ON d TO testuser
 
-query T
+query TTTTIT
 SHOW TABLES FROM test
 ----
-a
-b
-c
-d
-diamond
+public  a        table  root  0  NULL
+public  b        view   root  0  NULL
+public  c        view   root  0  NULL
+public  d        view   root  0  NULL
+public  diamond  view   root  0  NULL
 
 user testuser
 
-statement error user testuser does not have DROP privilege on view diamond
+statement error user testuser does not have DROP privilege on relation diamond
 DROP VIEW diamond
 
-statement error cannot drop view "d" because view "diamond" depends on it
+statement error cannot drop relation "d" because view "diamond" depends on it
 DROP VIEW d
 
 user root
@@ -77,45 +75,41 @@ GRANT ALL ON testuser2 to testuser
 statement ok
 GRANT ALL ON testuser3 to testuser
 
-query T
+query TTTTIT
 SHOW TABLES FROM test
 ----
-a
-b
-c
-d
-diamond
-testuser1
-testuser2
-testuser3
+public  a          table  root  0  NULL
+public  b          view   root  0  NULL
+public  c          view   root  0  NULL
+public  d          view   root  0  NULL
+public  diamond    view   root  0  NULL
+public  testuser1  view   root  0  NULL
+public  testuser2  view   root  0  NULL
+public  testuser3  view   root  0  NULL
 
 user testuser
 
 statement ok
 DROP VIEW testuser3
 
-query T
+query TTTTIT
 SHOW TABLES FROM test
 ----
-d
-testuser1
-testuser2
 
-statement error cannot drop view "testuser1" because view "testuser2" depends on it
+statement error cannot drop relation "testuser1" because view "testuser2" depends on it
 DROP VIEW testuser1
 
-statement error cannot drop view "testuser1" because view "testuser2" depends on it
+statement error cannot drop relation "testuser1" because view "testuser2" depends on it
 DROP VIEW testuser1 RESTRICT
 
 statement ok
 DROP VIEW testuser1 CASCADE
 
-query T
+query TTTTIT
 SHOW TABLES FROM test
 ----
-d
 
-statement error pgcode 42P01 view "testuser2" does not exist
+statement error pgcode 42P01 relation "testuser2" does not exist
 DROP VIEW testuser2
 
 user root
@@ -134,7 +128,7 @@ GRANT ALL ON d to testuser
 
 user testuser
 
-statement error user testuser does not have DROP privilege on view diamond
+statement error user testuser does not have DROP privilege on relation diamond
 DROP TABLE a CASCADE
 
 user root
@@ -142,7 +136,7 @@ user root
 statement ok
 DROP TABLE a CASCADE
 
-query T
+query TTTTIT
 SHOW TABLES FROM test
 ----
 
@@ -152,7 +146,7 @@ CREATE VIEW x AS VALUES (1, 2), (3, 4)
 statement ok
 CREATE VIEW y AS SELECT column1, column2 FROM x
 
-statement error cannot drop view "x" because view "y" depends on it
+statement error cannot drop relation "x" because view "y" depends on it
 DROP VIEW x
 
 statement ok
@@ -164,7 +158,7 @@ CREATE VIEW x AS VALUES (1, 2), (3, 4)
 statement ok
 CREATE VIEW y AS SELECT column1, column2 FROM x
 
-statement error cannot drop view "x" because view "y" depends on it
+statement error cannot drop relation "x" because view "y" depends on it
 DROP VIEW x
 
 statement ok
@@ -191,4 +185,4 @@ statement ok
 CREATE VIEW u AS SELECT a FROM a UNION SELECT a FROM a
 
 statement ok
-DROP DATABASE a
+DROP DATABASE a CASCADE

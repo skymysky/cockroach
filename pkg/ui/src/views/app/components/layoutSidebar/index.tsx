@@ -1,46 +1,102 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import React from "react";
-import { ListLink, LinkProps } from "src/views/shared/components/listLink";
-import * as Icons from "src/views/shared/components/icons";
-import { trustIcon } from "src/util/trust";
+import { connect } from "react-redux";
+import { Link, withRouter, RouteComponentProps } from "react-router-dom";
 
-interface IconLinkProps extends LinkProps {
-  icon?: string;
-  title?: string;
+import { SideNavigation } from "src/components";
+import "./navigation-bar.styl";
+import { AdminUIState } from "src/redux/state";
+import { isSingleNodeCluster } from "src/redux/nodes";
+
+interface RouteParam {
+  path: string;
+  text: string;
+  activeFor: string[];
+  // ignoreFor allows exclude specific paths from been recognized as active
+  // even if path is matched with activeFor paths.
+  ignoreFor?: string[];
+  isHidden?: () => boolean;
 }
 
-/**
- * IconLink creats a react router Link which contains both a graphical icon and
- * a string title.
- */
-class IconLink extends React.Component<IconLinkProps, {}> {
-  render() {
-    const passProps = {
-      to: this.props.to,
-      className: this.props.className,
-    };
-    return <ListLink {...passProps} >
-      <div className="image-container"
-           dangerouslySetInnerHTML={trustIcon(this.props.icon)}/>
-      <div>{this.props.title}</div>
-    </ListLink>;
-  }
-}
+type SidebarProps = RouteComponentProps & MapToStateProps;
 
 /**
- * SideBar represents the static navigation sidebar available on all pages. It
+ * Sidebar represents the static navigation sidebar available on all pages. It
  * displays a number of graphic icons representing available pages; the icon of
  * the page which is currently active will be highlighted.
  */
-export default class extends React.Component<{}, {}> {
+export class Sidebar extends React.Component<SidebarProps> {
+  readonly routes: RouteParam[] = [
+    { path: "/overview", text: "Overview", activeFor: ["/node"] },
+    { path: "/metrics", text: "Metrics", activeFor: [] },
+    { path: "/databases", text: "Databases", activeFor: ["/database"] },
+    { path: "/sessions", text: "Sessions", activeFor: ["/session"] },
+    {
+      path: "/transactions",
+      text: "Transactions",
+      activeFor: ["/transactions"],
+    },
+    { path: "/statements", text: "Statements", activeFor: ["/statement"] },
+    {
+      path: "/reports/network",
+      text: "Network Latency",
+      activeFor: ["/reports/network"],
+      // Do not show Network Latency for single node cluster.
+      isHidden: () => this.props.isSingleNodeCluster,
+    },
+    { path: "/jobs", text: "Jobs", activeFor: [] },
+    {
+      path: "/debug",
+      text: "Advanced Debug",
+      activeFor: ["/reports", "/data-distribution", "/raft"],
+      ignoreFor: ["/reports/network"],
+    },
+  ];
+
+  isActiveNavigationItem = (path: string): boolean => {
+    const { pathname } = this.props.location;
+    const { activeFor, ignoreFor = [] } = this.routes.find(
+      (route) => route.path === path,
+    );
+    return [...activeFor, path].some((p) => {
+      const isMatchedToIgnoredPaths = ignoreFor.some((ignorePath) =>
+        pathname.startsWith(ignorePath),
+      );
+      const isMatchedToActiveFor = pathname.startsWith(p);
+      return isMatchedToActiveFor && !isMatchedToIgnoredPaths;
+    });
+  };
+
   render() {
-    return <nav className="navigation-bar">
-      <ul className="navigation-bar__list">
-        <IconLink to="/cluster" icon={Icons.clusterIcon} title="Cluster" />
-        <IconLink to="/databases" icon={Icons.databaseIcon} title="Databases"/>
-      </ul>
-      <ul className="navigation-bar__list navigation-bar__list--bottom">
-        <IconLink to="/" icon={Icons.cockroachIcon} className="cockroach" />
-      </ul>
-    </nav>;
+    const navigationItems = this.routes
+      .filter((route) => !route.isHidden || !route.isHidden())
+      .map(({ path, text }, idx) => (
+        <SideNavigation.Item
+          isActive={this.isActiveNavigationItem(path)}
+          key={idx}
+        >
+          <Link to={path}>{text}</Link>
+        </SideNavigation.Item>
+      ));
+    return <SideNavigation>{navigationItems}</SideNavigation>;
   }
 }
+
+interface MapToStateProps {
+  isSingleNodeCluster: boolean;
+}
+
+const mapStateToProps = (state: AdminUIState) => ({
+  isSingleNodeCluster: isSingleNodeCluster(state),
+});
+
+export default withRouter(connect(mapStateToProps, null)(Sidebar));

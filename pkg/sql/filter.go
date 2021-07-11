@@ -1,80 +1,61 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
-	"bytes"
+	"context"
 
-	"golang.org/x/net/context"
-
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // filterNode implements a filtering stage. It is intended to be used
 // during plan optimizations in order to avoid instantiating a fully
 // blown selectTopNode/renderNode pair.
 type filterNode struct {
-	p          *planner
-	source     planDataSource
-	filter     parser.TypedExpr
-	ivarHelper parser.IndexedVarHelper
+	source      planDataSource
+	filter      tree.TypedExpr
+	ivarHelper  tree.IndexedVarHelper
+	reqOrdering ReqOrdering
 }
 
-// IndexedVarEval implements the parser.IndexedVarContainer interface.
-func (f *filterNode) IndexedVarEval(idx int, ctx *parser.EvalContext) (parser.Datum, error) {
+// filterNode implements tree.IndexedVarContainer
+var _ tree.IndexedVarContainer = &filterNode{}
+
+// IndexedVarEval implements the tree.IndexedVarContainer interface.
+func (f *filterNode) IndexedVarEval(idx int, ctx *tree.EvalContext) (tree.Datum, error) {
 	return f.source.plan.Values()[idx].Eval(ctx)
 }
 
-// IndexedVarResolvedType implements the parser.IndexedVarContainer interface.
-func (f *filterNode) IndexedVarResolvedType(idx int) parser.Type {
-	return f.source.info.sourceColumns[idx].Typ
+// IndexedVarResolvedType implements the tree.IndexedVarContainer interface.
+func (f *filterNode) IndexedVarResolvedType(idx int) *types.T {
+	return f.source.columns[idx].Typ
 }
 
-// IndexedVarFormat implements the parser.IndexedVarContainer interface.
-func (f *filterNode) IndexedVarFormat(buf *bytes.Buffer, fl parser.FmtFlags, idx int) {
-	f.source.info.FormatVar(buf, fl, idx)
+// IndexedVarNodeFormatter implements the tree.IndexedVarContainer interface.
+func (f *filterNode) IndexedVarNodeFormatter(idx int) tree.NodeFormatter {
+	return f.source.columns.NodeFormatter(idx)
 }
 
-// Start implements the planNode interface.
-func (f *filterNode) Start(ctx context.Context) error {
-	return f.source.plan.Start(ctx)
+func (f *filterNode) startExec(runParams) error {
+	return nil
 }
 
 // Next implements the planNode interface.
-func (f *filterNode) Next(ctx context.Context) (bool, error) {
-	for {
-		if next, err := f.source.plan.Next(ctx); !next {
-			return false, err
-		}
-
-		passesFilter, err := sqlbase.RunFilter(f.filter, &f.p.evalCtx)
-		if err != nil {
-			return false, err
-		}
-
-		if passesFilter {
-			return true, nil
-		}
-		// Row was filtered out; grab the next row.
-	}
+func (f *filterNode) Next(params runParams) (bool, error) {
+	panic("filterNode cannot be run in local mode")
 }
 
-func (f *filterNode) Close(ctx context.Context) {
-	f.source.plan.Close(ctx)
+func (f *filterNode) Values() tree.Datums {
+	panic("filterNode cannot be run in local mode")
 }
-func (f *filterNode) Values() parser.Datums { return f.source.plan.Values() }
+
+func (f *filterNode) Close(ctx context.Context) { f.source.plan.Close(ctx) }

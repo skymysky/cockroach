@@ -1,18 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package httputil
 
@@ -22,9 +16,9 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/jsonpb"
-	"github.com/gogo/protobuf/proto"
-	"github.com/pkg/errors"
 )
 
 const (
@@ -52,17 +46,20 @@ const (
 
 // GetJSON uses the supplied client to GET the URL specified by the parameters
 // and unmarshals the result into response.
-func GetJSON(httpClient http.Client, path string, response proto.Message) error {
+// TODO(someone): make this context-aware, see client.go.
+func GetJSON(httpClient http.Client, path string, response protoutil.Message) error {
 	req, err := http.NewRequest("GET", path, nil)
 	if err != nil {
 		return err
 	}
-	return doJSONRequest(httpClient, req, response)
+	_, err = doJSONRequest(httpClient, req, response)
+	return err
 }
 
 // PostJSON uses the supplied client to POST request to the URL specified by
 // the parameters and unmarshals the result into response.
-func PostJSON(httpClient http.Client, path string, request, response proto.Message) error {
+// TODO(someone): make this context-aware, see client.go.
+func PostJSON(httpClient http.Client, path string, request, response protoutil.Message) error {
 	// Hack to avoid upsetting TestProtoMarshal().
 	marshalFn := (&jsonpb.Marshaler{}).Marshal
 
@@ -74,22 +71,51 @@ func PostJSON(httpClient http.Client, path string, request, response proto.Messa
 	if err != nil {
 		return err
 	}
+	_, err = doJSONRequest(httpClient, req, response)
+	return err
+}
+
+// PostJSONWithRequest uses the supplied client to POST request to the URL
+// specified by the parameters and unmarshals the result into response.
+//
+// The response is returned to the caller, though its body will have been
+// closed.
+// TODO(someone): make this context-aware, see client.go.
+func PostJSONWithRequest(
+	httpClient http.Client, path string, request, response protoutil.Message,
+) (*http.Response, error) {
+	// Hack to avoid upsetting TestProtoMarshal().
+	marshalFn := (&jsonpb.Marshaler{}).Marshal
+
+	var buf bytes.Buffer
+	if err := marshalFn(&buf, request); err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest("POST", path, &buf)
+	if err != nil {
+		return nil, err
+	}
+
 	return doJSONRequest(httpClient, req, response)
 }
 
-func doJSONRequest(httpClient http.Client, req *http.Request, response proto.Message) error {
+func doJSONRequest(
+	httpClient http.Client, req *http.Request, response protoutil.Message,
+) (*http.Response, error) {
 	if timeout := httpClient.Timeout; timeout > 0 {
 		req.Header.Set("Grpc-Timeout", strconv.FormatInt(timeout.Nanoseconds(), 10)+"n")
 	}
 	req.Header.Set(AcceptHeader, JSONContentType)
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if contentType := resp.Header.Get(ContentTypeHeader); !(resp.StatusCode == http.StatusOK && contentType == JSONContentType) {
 		b, err := ioutil.ReadAll(resp.Body)
-		return errors.Errorf("status: %s, content-type: %s, body: %s, error: %v", resp.Status, contentType, b, err)
+		return resp, errors.Errorf(
+			"status: %s, content-type: %s, body: %s, error: %v", resp.Status, contentType, b, err,
+		)
 	}
-	return jsonpb.Unmarshal(resp.Body, response)
+	return resp, jsonpb.Unmarshal(resp.Body, response)
 }

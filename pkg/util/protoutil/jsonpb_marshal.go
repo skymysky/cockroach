@@ -1,18 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package protoutil
 
@@ -23,12 +17,10 @@ import (
 	"io"
 	"reflect"
 
+	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/gogo/protobuf/proto"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
-	"github.com/pkg/errors"
-
-	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 )
 
 var _ gwruntime.Marshaler = (*JSONPb)(nil)
@@ -40,7 +32,10 @@ type JSONPb jsonpb.Marshaler
 
 // ContentType implements gwruntime.Marshaler.
 func (*JSONPb) ContentType() string {
-	return httputil.JSONContentType
+	// NB: This is the same as httputil.JSONContentType which we can't use due to
+	// an import cycle.
+	const JSONContentType = "application/json"
+	return JSONContentType
 }
 
 // Marshal implements gwruntime.Marshaler.
@@ -51,6 +46,8 @@ func (j *JSONPb) Marshal(v interface{}) ([]byte, error) {
 // a lower-case version of marshal to allow for a call from
 // marshalNonProtoField without upsetting TestProtoMarshal().
 func (j *JSONPb) marshal(v interface{}) ([]byte, error) {
+	// NB: we use proto.Message here because grpc-gateway passes us protos that
+	// we don't control and thus don't implement protoutil.Message.
 	if pb, ok := v.(proto.Message); ok {
 		var buf bytes.Buffer
 		marshalFn := (*jsonpb.Marshaler)(j).Marshal
@@ -100,6 +97,8 @@ func (j *JSONPb) marshalNonProtoField(v interface{}) ([]byte, error) {
 
 // Unmarshal implements gwruntime.Marshaler.
 func (j *JSONPb) Unmarshal(data []byte, v interface{}) error {
+	// NB: we use proto.Message here because grpc-gateway passes us protos that
+	// we don't control and thus don't implement protoutil.Message.
 	if pb, ok := v.(proto.Message); ok {
 		return jsonpb.Unmarshal(bytes.NewReader(data), pb)
 	}
@@ -109,6 +108,8 @@ func (j *JSONPb) Unmarshal(data []byte, v interface{}) error {
 // NewDecoder implements gwruntime.Marshaler.
 func (j *JSONPb) NewDecoder(r io.Reader) gwruntime.Decoder {
 	return gwruntime.DecoderFunc(func(v interface{}) error {
+		// NB: we use proto.Message here because grpc-gateway passes us protos that
+		// we don't control and thus don't implement protoutil.Message.
 		if pb, ok := v.(proto.Message); ok {
 			return jsonpb.Unmarshal(r, pb)
 		}
@@ -119,10 +120,19 @@ func (j *JSONPb) NewDecoder(r io.Reader) gwruntime.Decoder {
 // NewEncoder implements gwruntime.Marshaler.
 func (j *JSONPb) NewEncoder(w io.Writer) gwruntime.Encoder {
 	return gwruntime.EncoderFunc(func(v interface{}) error {
+		// NB: we use proto.Message here because grpc-gateway passes us protos that
+		// we don't control and thus don't implement protoutil.Message.
 		if pb, ok := v.(proto.Message); ok {
 			marshalFn := (*jsonpb.Marshaler)(j).Marshal
 			return marshalFn(w, pb)
 		}
 		return errors.Errorf("unexpected type %T does not implement %s", v, typeProtoMessage)
 	})
+}
+
+var _ gwruntime.Delimited = (*JSONPb)(nil)
+
+// Delimiter implements gwruntime.Delimited.
+func (*JSONPb) Delimiter() []byte {
+	return []byte("\n")
 }

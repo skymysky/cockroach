@@ -1,18 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt.r.tracy@gmail.com)
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package ts
 
@@ -84,7 +78,7 @@ func TestDataKeys(t *testing.T) {
 		if !reflect.DeepEqual(d, tc) {
 			t.Errorf("%d: decoded values %v did not match expected %v", i, d, tc)
 		}
-		if pretty := keys.PrettyPrint(encoded); tc.expectedPretty != pretty {
+		if pretty := keys.PrettyPrint(nil /* valDirs */, encoded); tc.expectedPretty != pretty {
 			t.Errorf("%d: expected %s, but got %s", i, tc.expectedPretty, pretty)
 		}
 	}

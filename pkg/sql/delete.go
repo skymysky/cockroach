@@ -1,210 +1,216 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
-	"golang.org/x/net/context"
+	"context"
+	"sync"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
+var deleteNodePool = sync.Pool{
+	New: func() interface{} {
+		return &deleteNode{}
+	},
+}
+
 type deleteNode struct {
-	editNodeBase
-	n *parser.Delete
+	source planNode
 
-	tw tableDeleter
+	// columns is set if this DELETE is returning any rows, to be
+	// consumed by a renderNode upstream. This occurs when there is a
+	// RETURNING clause with some scalar expressions.
+	columns colinfo.ResultColumns
 
-	run struct {
-		// The following fields are populated during Start().
-		editNodeRun
-
-		fastPath bool
-	}
+	run deleteRun
 }
 
-// Delete removes rows from a table.
-// Privileges: DELETE and SELECT on table. We currently always use a SELECT statement.
-//   Notes: postgres requires DELETE. Also requires SELECT for "USING" and "WHERE" with tables.
-//          mysql requires DELETE. Also requires SELECT if a table is used in the "WHERE" clause.
-func (p *planner) Delete(
-	ctx context.Context, n *parser.Delete, desiredTypes []parser.Type,
-) (planNode, error) {
-	tn, err := p.getAliasedTableName(n.Table)
-	if err != nil {
-		return nil, err
-	}
+// deleteRun contains the run-time state of deleteNode during local execution.
+type deleteRun struct {
+	td         tableDeleter
+	rowsNeeded bool
 
-	en, err := p.makeEditNode(ctx, tn, privilege.DELETE)
-	if err != nil {
-		return nil, err
-	}
+	// done informs a new call to BatchedNext() that the previous call
+	// to BatchedNext() has completed the work already.
+	done bool
 
-	var requestedCols []sqlbase.ColumnDescriptor
-	if _, retExprs := n.Returning.(*parser.ReturningExprs); retExprs {
-		// TODO(dan): This could be made tighter, just the rows needed for RETURNING
-		// exprs.
-		requestedCols = en.tableDesc.Columns
-	}
+	// traceKV caches the current KV tracing flag.
+	traceKV bool
 
-	fkTables := sqlbase.TablesNeededForFKs(*en.tableDesc, sqlbase.CheckDeletes)
-	if err := p.fillFKTableMap(ctx, fkTables); err != nil {
-		return nil, err
-	}
-	rd, err := sqlbase.MakeRowDeleter(p.txn, en.tableDesc, fkTables, requestedCols, sqlbase.CheckFKs)
-	if err != nil {
-		return nil, err
-	}
-	tw := tableDeleter{rd: rd, autoCommit: p.autoCommit}
+	// partialIndexDelValsOffset is the offset of partial index delete
+	// indicators in the source values. It is equal to the number of fetched
+	// columns.
+	partialIndexDelValsOffset int
 
-	// TODO(knz): Until we split the creation of the node from Start()
-	// for the SelectClause too, we cannot cache this. This is because
-	// this node's initSelect() method both does type checking and also
-	// performs index selection. We cannot perform index selection
-	// properly until the placeholder values are known.
-	rows, err := p.SelectClause(ctx, &parser.SelectClause{
-		Exprs: sqlbase.ColumnsSelectors(rd.FetchCols),
-		From:  &parser.From{Tables: []parser.TableExpr{n.Table}},
-		Where: n.Where,
-	}, nil, nil, nil, publicAndNonPublicColumns)
-	if err != nil {
-		return nil, err
-	}
-
-	dn := &deleteNode{
-		n:            n,
-		editNodeBase: en,
-		tw:           tw,
-	}
-
-	if err := dn.run.initEditNode(
-		ctx, &dn.editNodeBase, rows, &dn.tw, n.Returning, desiredTypes); err != nil {
-		return nil, err
-	}
-
-	return dn, nil
+	// rowIdxToRetIdx is the mapping from the columns returned by the deleter
+	// to the columns in the resultRowBuffer. A value of -1 is used to indicate
+	// that the column at that index is not part of the resultRowBuffer
+	// of the mutation. Otherwise, the value at the i-th index refers to the
+	// index of the resultRowBuffer where the i-th column is to be returned.
+	rowIdxToRetIdx []int
 }
 
-func (d *deleteNode) Start(ctx context.Context) error {
-	if err := d.run.startEditNode(ctx, &d.editNodeBase); err != nil {
-		return err
-	}
+func (d *deleteNode) startExec(params runParams) error {
+	// cache traceKV during execution, to avoid re-evaluating it for every row.
+	d.run.traceKV = params.p.ExtendedEvalContext().Tracing.KVTracingEnabled()
 
-	// Check if we can avoid doing a round-trip to read the values and just
-	// "fast-path" skip to deleting the key ranges without reading them first.
-	// TODO(dt): We could probably be smarter when presented with an index-join,
-	// but this goes away anyway once we push-down more of SQL.
-	maybeScan := d.run.rows
-	if sel, ok := maybeScan.(*renderNode); ok {
-		maybeScan = sel.source.plan
+	if d.run.rowsNeeded {
+		d.run.td.rows = rowcontainer.NewRowContainer(
+			params.EvalContext().Mon.MakeBoundAccount(),
+			colinfo.ColTypeInfoFromResCols(d.columns))
 	}
-	if scan, ok := maybeScan.(*scanNode); ok && canDeleteWithoutScan(ctx, d.n, scan, &d.tw) {
-		d.run.fastPath = true
-		err := d.fastDelete(ctx, scan)
-		return err
-	}
-
-	return d.run.tw.init(d.p.txn)
+	return d.run.td.init(params.ctx, params.p.txn, params.EvalContext())
 }
 
-func (d *deleteNode) Close(ctx context.Context) {
-	d.run.rows.Close(ctx)
-}
+// Next is required because batchedPlanNode inherits from planNode, but
+// batchedPlanNode doesn't really provide it. See the explanatory comments
+// in plan_batch.go.
+func (d *deleteNode) Next(params runParams) (bool, error) { panic("not valid") }
 
-func (d *deleteNode) FastPathResults() (int, bool) {
-	if d.run.fastPath {
-		return d.rh.rowCount, true
+// Values is required because batchedPlanNode inherits from planNode, but
+// batchedPlanNode doesn't really provide it. See the explanatory comments
+// in plan_batch.go.
+func (d *deleteNode) Values() tree.Datums { panic("not valid") }
+
+// BatchedNext implements the batchedPlanNode interface.
+func (d *deleteNode) BatchedNext(params runParams) (bool, error) {
+	if d.run.done {
+		return false, nil
 	}
-	return 0, false
-}
 
-func (d *deleteNode) Next(ctx context.Context) (bool, error) {
-	traceKV := d.p.session.Tracing.KVTracingEnabled()
-
-	next, err := d.run.rows.Next(ctx)
-	if !next {
-		if err == nil {
-			// We're done. Finish the batch.
-			err = d.tw.finalize(ctx, traceKV)
+	// Advance one batch. First, clear the last batch.
+	d.run.td.clearLastBatch(params.ctx)
+	// Now consume/accumulate the rows for this batch.
+	lastBatch := false
+	for {
+		if err := params.p.cancelChecker.Check(); err != nil {
+			return false, err
 		}
-		return false, err
+
+		// Advance one individual row.
+		if next, err := d.source.Next(params); !next {
+			lastBatch = true
+			if err != nil {
+				return false, err
+			}
+			break
+		}
+
+		// Process the deletion of the current source row,
+		// potentially accumulating the result row for later.
+		if err := d.processSourceRow(params, d.source.Values()); err != nil {
+			return false, err
+		}
+
+		// Are we done yet with the current batch?
+		if d.run.td.currentBatchSize >= d.run.td.maxBatchSize {
+			break
+		}
 	}
 
-	rowVals := d.run.rows.Values()
-
-	_, err = d.tw.row(ctx, rowVals, traceKV)
-	if err != nil {
-		return false, err
+	if d.run.td.currentBatchSize > 0 {
+		if !lastBatch {
+			// We only run/commit the batch if there were some rows processed
+			// in this batch.
+			if err := d.run.td.flushAndStartNewBatch(params.ctx); err != nil {
+				return false, err
+			}
+		}
 	}
 
-	resultRow, err := d.rh.cookResultRow(rowVals)
-	if err != nil {
-		return false, err
+	if lastBatch {
+		if err := d.run.td.finalize(params.ctx); err != nil {
+			return false, err
+		}
+		// Remember we're done for the next call to BatchedNext().
+		d.run.done = true
 	}
-	d.run.resultRow = resultRow
 
-	return true, nil
+	// Possibly initiate a run of CREATE STATISTICS.
+	params.ExecCfg().StatsRefresher.NotifyMutation(
+		d.run.td.tableDesc().GetID(),
+		d.run.td.lastBatchSize,
+	)
+
+	return d.run.td.lastBatchSize > 0, nil
 }
 
-// Determine if the deletion of `rows` can be done without actually scanning them,
-// i.e. if we do not need to know their values for filtering expressions or a
-// RETURNING clause or for updating secondary indexes.
-func canDeleteWithoutScan(
-	ctx context.Context, n *parser.Delete, scan *scanNode, td *tableDeleter,
-) bool {
-	if !td.fastPathAvailable(ctx) {
-		return false
-	}
-	if _, ok := n.Returning.(*parser.ReturningExprs); ok {
-		if log.V(2) {
-			log.Infof(ctx, "delete forced to scan: values required for RETURNING")
-		}
-		return false
-	}
-	if scan.filter != nil {
-		if log.V(2) {
-			log.Infof(ctx, "delete forced to scan: values required for filter (%s)", scan.filter)
-		}
-		return false
-	}
-	return true
-}
+// processSourceRow processes one row from the source for deletion and, if
+// result rows are needed, saves it in the result row container
+func (d *deleteNode) processSourceRow(params runParams, sourceVals tree.Datums) error {
+	// Create a set of partial index IDs to not delete from. Indexes should not
+	// be deleted from when they are partial indexes and the row does not
+	// satisfy the predicate and therefore do not exist in the partial index.
+	// This set is passed as a argument to tableDeleter.row below.
+	var pm row.PartialIndexUpdateHelper
+	if n := len(d.run.td.tableDesc().PartialIndexes()); n > 0 {
+		offset := d.run.partialIndexDelValsOffset
+		partialIndexDelVals := sourceVals[offset : offset+n]
 
-// `fastDelete` skips the scan of rows and just deletes the ranges that
-// `rows` would scan. Should only be used if `canDeleteWithoutScan` indicates
-// that it is safe to do so.
-func (d *deleteNode) fastDelete(ctx context.Context, scan *scanNode) error {
-	if err := scan.initScan(ctx); err != nil {
+		err := pm.Init(tree.Datums{}, partialIndexDelVals, d.run.td.tableDesc())
+		if err != nil {
+			return err
+		}
+
+		// Truncate sourceVals so that it no longer includes partial index
+		// predicate values.
+		sourceVals = sourceVals[:d.run.partialIndexDelValsOffset]
+	}
+
+	// Queue the deletion in the KV batch.
+	if err := d.run.td.row(params.ctx, sourceVals, pm, d.run.traceKV); err != nil {
 		return err
 	}
 
-	if err := d.tw.init(d.p.txn); err != nil {
-		return err
+	// If result rows need to be accumulated, do it.
+	if d.run.td.rows != nil {
+		// The new values can include all columns, the construction of the
+		// values has used execinfra.ScanVisibilityPublicAndNotPublic so the
+		// values may contain additional columns for every newly dropped column
+		// not visible. We do not want them to be available for RETURNING.
+		//
+		// d.run.rows.NumCols() is guaranteed to only contain the requested
+		// public columns.
+		resultValues := make(tree.Datums, d.run.td.rows.NumCols())
+		for i, retIdx := range d.run.rowIdxToRetIdx {
+			if retIdx >= 0 {
+				resultValues[retIdx] = sourceVals[i]
+			}
+		}
+
+		if _, err := d.run.td.rows.AddRow(params.ctx, resultValues); err != nil {
+			return err
+		}
 	}
-	rowCount, err := d.tw.fastDelete(ctx, scan, d.p.session.Tracing.KVTracingEnabled())
-	if err != nil {
-		return err
-	}
-	d.rh.rowCount += rowCount
+
 	return nil
 }
 
-func (d *deleteNode) Values() parser.Datums {
-	return d.run.resultRow
+// BatchedCount implements the batchedPlanNode interface.
+func (d *deleteNode) BatchedCount() int { return d.run.td.lastBatchSize }
+
+// BatchedCount implements the batchedPlanNode interface.
+func (d *deleteNode) BatchedValues(rowIdx int) tree.Datums { return d.run.td.rows.At(rowIdx) }
+
+func (d *deleteNode) Close(ctx context.Context) {
+	d.source.Close(ctx)
+	d.run.td.close(ctx)
+	*d = deleteNode{}
+	deleteNodePool.Put(d)
+}
+
+func (d *deleteNode) enableAutoCommit() {
+	d.run.td.enableAutoCommit()
 }

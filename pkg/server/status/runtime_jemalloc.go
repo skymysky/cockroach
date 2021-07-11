@@ -1,18 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // +build !stdmalloc
 
@@ -20,12 +14,6 @@ package status
 
 // #cgo CPPFLAGS: -DJEMALLOC_NO_DEMANGLE
 // #cgo LDFLAGS: -ljemalloc
-// // On macOS, je_zone_register is run at init time to register
-// // jemalloc with the system allocator. Unfortunately, all the
-// // machinery for this is in a single file, and is not referenced
-// // elsewhere, causing the linker to omit the file's symbols.
-// // Manually force the presence of these symbols on macOS.
-// #cgo darwin LDFLAGS: -u_je_zone_register
 // #cgo dragonfly freebsd LDFLAGS: -lm
 // #cgo linux LDFLAGS: -lrt -lm -lpthread
 //
@@ -86,13 +74,13 @@ package status
 import "C"
 
 import (
+	"context"
+	"math"
 	"reflect"
 	"strings"
 
-	"github.com/dustin/go-humanize"
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/dustin/go-humanize"
 )
 
 func init() {
@@ -120,7 +108,11 @@ func getJemallocStats(ctx context.Context) (uint, uint, error) {
 		log.Infof(ctx, "jemalloc stats: %s", strings.Join(stats, " "))
 	}
 
-	if log.V(3) {
+	// NB: the `!V(MaxInt32)` condition is a workaround to not spew this to the
+	// logs whenever log interception (log spy) is active. If we refactored
+	// je_malloc_stats_print to return a string that we can `log.Infof` instead,
+	// we wouldn't need this.
+	if log.V(3) && !log.V(math.MaxInt32) {
 		// Detailed jemalloc stats (very verbose, includes per-arena stats).
 		C.je_malloc_stats_print(nil, nil, nil)
 	}
@@ -130,6 +122,6 @@ func getJemallocStats(ctx context.Context) (uint, uint, error) {
 
 // Used to force allocation in tests. 'import "C"' is not supported in tests.
 func allocateMemory() {
-	// Empirically, 8KiB is not enough, but 16KiB is.
-	C.malloc(16 << 10)
+	// Empirically, 8KiB is not enough, but 16KiB is except for ppc64le, where 256KiB is needed.
+	C.malloc(256 << 10)
 }

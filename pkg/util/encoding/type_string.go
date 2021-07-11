@@ -2,25 +2,46 @@
 
 package encoding
 
-import "fmt"
+import "strconv"
 
-const (
-	_Type_name_0 = "UnknownNullNotNullIntFloatDecimalBytesBytesDescTimeDurationTrueFalseUUID"
-	_Type_name_1 = "SentinelType"
-)
+func _() {
+	// An "invalid array index" compiler error signifies that the constant values have changed.
+	// Re-run the stringer command to generate them again.
+	var x [1]struct{}
+	_ = x[Unknown-0]
+	_ = x[Null-1]
+	_ = x[NotNull-2]
+	_ = x[Int-3]
+	_ = x[Float-4]
+	_ = x[Decimal-5]
+	_ = x[Bytes-6]
+	_ = x[BytesDesc-7]
+	_ = x[Time-8]
+	_ = x[Duration-9]
+	_ = x[True-10]
+	_ = x[False-11]
+	_ = x[UUID-12]
+	_ = x[Array-13]
+	_ = x[IPAddr-14]
+	_ = x[JSON-15]
+	_ = x[Tuple-16]
+	_ = x[BitArray-17]
+	_ = x[BitArrayDesc-18]
+	_ = x[TimeTZ-19]
+	_ = x[Geo-20]
+	_ = x[GeoDesc-21]
+	_ = x[ArrayKeyAsc-22]
+	_ = x[ArrayKeyDesc-23]
+	_ = x[Box2D-24]
+}
 
-var (
-	_Type_index_0 = [...]uint8{0, 7, 11, 18, 21, 26, 33, 38, 47, 51, 59, 63, 68, 72}
-	_Type_index_1 = [...]uint8{0, 12}
-)
+const _Type_name = "UnknownNullNotNullIntFloatDecimalBytesBytesDescTimeDurationTrueFalseUUIDArrayIPAddrJSONTupleBitArrayBitArrayDescTimeTZGeoGeoDescArrayKeyAscArrayKeyDescBox2D"
+
+var _Type_index = [...]uint8{0, 7, 11, 18, 21, 26, 33, 38, 47, 51, 59, 63, 68, 72, 77, 83, 87, 92, 100, 112, 118, 121, 128, 139, 151, 156}
 
 func (i Type) String() string {
-	switch {
-	case 0 <= i && i <= 12:
-		return _Type_name_0[_Type_index_0[i]:_Type_index_0[i+1]]
-	case i == 15:
-		return _Type_name_1
-	default:
-		return fmt.Sprintf("Type(%d)", i)
+	if i < 0 || i >= Type(len(_Type_index)-1) {
+		return "Type(" + strconv.FormatInt(int64(i), 10) + ")"
 	}
+	return _Type_name[_Type_index[i]:_Type_index[i+1]]
 }

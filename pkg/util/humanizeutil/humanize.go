@@ -1,18 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Bram Gruneir (bram+code@cockroachlabs.com)
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package humanizeutil
 
@@ -21,6 +15,7 @@ import (
 	"fmt"
 	"math"
 	"sync/atomic"
+	"time"
 
 	"github.com/dustin/go-humanize"
 	"github.com/spf13/pflag"
@@ -76,7 +71,7 @@ var _ pflag.Value = &BytesValue{}
 
 // NewBytesValue creates a new pflag.Value bound to the specified
 // int64 variable. It also happens to be a flag.Value.
-func NewBytesValue(val *int64) pflag.Value {
+func NewBytesValue(val *int64) *BytesValue {
 	return &BytesValue{val: val}
 }
 
@@ -85,6 +80,9 @@ func (b *BytesValue) Set(s string) error {
 	v, err := ParseBytes(s)
 	if err != nil {
 		return err
+	}
+	if b.val == nil {
+		b.val = new(int64)
 	}
 	atomic.StoreInt64(b.val, v)
 	b.isSet = true
@@ -98,15 +96,32 @@ func (b *BytesValue) Type() string {
 
 // String implements the flag.Value and pflag.Value interfaces.
 func (b *BytesValue) String() string {
-	// We need to be able to print the zero value in order for go's flags
-	// package to not choke when comparing values to the zero value,
-	// as it does in isZeroValue as of go1.8:
-	// https://github.com/golang/go/blob/release-branch.go1.8/src/flag/flag.go#L384
+	// When b.val is nil, the real value of the flag will only be known after a
+	// Resolve() call. We do not want our flag package to report an erroneous
+	// default value for this flag. So the value we return here must cause
+	// defaultIsZeroValue to return true:
+	// https://github.com/spf13/pflag/blob/v1.0.5/flag.go#L724
 	if b.val == nil {
-		return IBytes(0)
+		return "<nil>"
 	}
 	// This uses the MiB, GiB, etc suffixes. If we use humanize.Bytes() we get
 	// the MB, GB, etc suffixes, but the conversion is done in multiples of 1000
 	// vs 1024.
 	return IBytes(atomic.LoadInt64(b.val))
+}
+
+// IsSet returns true iff Set has successfully been called.
+func (b *BytesValue) IsSet() bool {
+	return b.isSet
+}
+
+// DataRate formats the passed byte count over duration as "x MiB/s".
+func DataRate(bytes int64, elapsed time.Duration) string {
+	if bytes == 0 {
+		return "0"
+	}
+	if elapsed == 0 {
+		return "inf"
+	}
+	return fmt.Sprintf("%0.2f MiB/s", (float64(bytes)/elapsed.Seconds())/float64(1<<20))
 }

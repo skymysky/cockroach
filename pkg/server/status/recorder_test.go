@@ -1,40 +1,38 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt.r.tracy@gmail.com)
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package status
 
 import (
+	"context"
+	"io/ioutil"
 	"os"
 	"reflect"
 	"sort"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/kr/pretty"
-
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/metric/aggmetric"
+	"github.com/cockroachdb/cockroach/pkg/util/system"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/kr/pretty"
 )
 
 // byTimeAndName is a slice of tspb.TimeSeriesData.
@@ -68,7 +66,7 @@ func (a byStoreID) Less(i, j int) bool {
 var _ sort.Interface = byStoreID{}
 
 // byStoreDescID is a slice of storage.StoreStatus
-type byStoreDescID []StoreStatus
+type byStoreDescID []statuspb.StoreStatus
 
 // implement sort.Interface for byStoreDescID.
 func (a byStoreDescID) Len() int      { return len(a) }
@@ -83,7 +81,6 @@ var _ sort.Interface = byStoreDescID{}
 // interact with stores.
 type fakeStore struct {
 	storeID  roachpb.StoreID
-	stats    enginepb.MVCCStats
 	desc     roachpb.StoreDescriptor
 	registry *metric.Registry
 }
@@ -92,12 +89,8 @@ func (fs fakeStore) StoreID() roachpb.StoreID {
 	return fs.storeID
 }
 
-func (fs fakeStore) Descriptor() (*roachpb.StoreDescriptor, error) {
+func (fs fakeStore) Descriptor(_ context.Context, _ bool) (*roachpb.StoreDescriptor, error) {
 	return &fs.desc, nil
-}
-
-func (fs fakeStore) MVCCStats() enginepb.MVCCStats {
-	return fs.stats
 }
 
 func (fs fakeStore) Registry() *metric.Registry {
@@ -121,6 +114,7 @@ func TestMetricsRecorder(t *testing.T) {
 		Capacity: roachpb.StoreCapacity{
 			Capacity:  100,
 			Available: 50,
+			Used:      50,
 		},
 	}
 	storeDesc2 := roachpb.StoreDescriptor{
@@ -128,6 +122,7 @@ func TestMetricsRecorder(t *testing.T) {
 		Capacity: roachpb.StoreCapacity{
 			Capacity:  200,
 			Available: 75,
+			Used:      125,
 		},
 	}
 
@@ -147,16 +142,17 @@ func TestMetricsRecorder(t *testing.T) {
 		registry: metric.NewRegistry(),
 	}
 	manual := hlc.NewManualClock(100)
-	recorder := NewMetricsRecorder(hlc.NewClock(manual.UnixNano, time.Nanosecond), nil, nil, nil)
+	st := cluster.MakeTestingClusterSettings()
+	recorder := NewMetricsRecorder(hlc.NewClock(manual.UnixNano, time.Nanosecond), nil, nil, nil, st)
 	recorder.AddStore(store1)
 	recorder.AddStore(store2)
-	recorder.AddNode(reg1, nodeDesc, 50, "foo:26257", "foo:26258")
+	recorder.AddNode(reg1, nodeDesc, 50, "foo:26257", "foo:26258", "foo:5432")
 
 	// Ensure the metric system's view of time does not advance during this test
 	// as the test expects time to not advance too far which would age the actual
 	// data (e.g. in histogram's) unexpectedly.
 	defer metric.TestingSetNow(func() time.Time {
-		return time.Unix(0, manual.UnixNano()).UTC()
+		return timeutil.Unix(0, manual.UnixNano())
 	})()
 
 	// ========================================
@@ -205,9 +201,10 @@ func TestMetricsRecorder(t *testing.T) {
 		{"testGauge", "gauge", 20},
 		{"testGaugeFloat64", "floatgauge", 20},
 		{"testCounter", "counter", 5},
-		{"testCounterWithRates", "counterwithrates", 2},
 		{"testHistogram", "histogram", 10},
 		{"testLatency", "latency", 10},
+		{"testAggGauge", "agggauge", 4},
+		{"testAggCounter", "aggcounter", 7},
 
 		// Stats needed for store summaries.
 		{"ranges", "counter", 1},
@@ -278,10 +275,17 @@ func TestMetricsRecorder(t *testing.T) {
 				reg.reg.AddMetric(c)
 				c.Inc((data.val))
 				addExpected(reg.prefix, data.name, reg.source, 100, data.val, reg.isNode)
-			case "counterwithrates":
-				r := metric.NewCounterWithRates(metric.Metadata{Name: reg.prefix + data.name})
-				reg.reg.AddMetric(r)
-				r.Inc(data.val)
+			case "aggcounter":
+				ac := aggmetric.NewCounter(metric.Metadata{Name: reg.prefix + data.name}, "foo")
+				reg.reg.AddMetric(ac)
+				c := ac.AddChild("bar")
+				c.Inc((data.val))
+				addExpected(reg.prefix, data.name, reg.source, 100, data.val, reg.isNode)
+			case "agggauge":
+				ac := aggmetric.NewGauge(metric.Metadata{Name: reg.prefix + data.name}, "foo")
+				reg.reg.AddMetric(ac)
+				c := ac.AddChild("bar")
+				c.Inc((data.val))
 				addExpected(reg.prefix, data.name, reg.source, 100, data.val, reg.isNode)
 			case "histogram":
 				h := metric.NewHistogram(metric.Metadata{Name: reg.prefix + data.name}, time.Second, 1000, 2)
@@ -290,6 +294,7 @@ func TestMetricsRecorder(t *testing.T) {
 				for _, q := range recordHistogramQuantiles {
 					addExpected(reg.prefix, data.name+q.suffix, reg.source, 100, data.val, reg.isNode)
 				}
+				addExpected(reg.prefix, data.name+"-count", reg.source, 100, 1, reg.isNode)
 			case "latency":
 				l := metric.NewLatency(metric.Metadata{Name: reg.prefix + data.name}, time.Hour)
 				reg.reg.AddMetric(l)
@@ -299,6 +304,7 @@ func TestMetricsRecorder(t *testing.T) {
 				for _, q := range recordHistogramQuantiles {
 					addExpected(reg.prefix, data.name+q.suffix, reg.source, 100, data.val, reg.isNode)
 				}
+				addExpected(reg.prefix, data.name+"-count", reg.source, 100, 1, reg.isNode)
 			default:
 				t.Fatalf("unexpected: %+v", data)
 			}
@@ -318,16 +324,21 @@ func TestMetricsRecorder(t *testing.T) {
 		t.Errorf("recorder did not yield expected time series collection; diff:\n %v", pretty.Diff(e, a))
 	}
 
+	totalMemory, err := GetTotalMemory(context.Background())
+	if err != nil {
+		t.Error("couldn't get total memory", err)
+	}
+
 	// ========================================
 	// Verify node summary generation
 	// ========================================
-	expectedNodeSummary := &NodeStatus{
+	expectedNodeSummary := &statuspb.NodeStatus{
 		Desc:      nodeDesc,
 		BuildInfo: build.GetInfo(),
 		StartedAt: 50,
 		UpdatedAt: 100,
 		Metrics:   expectedNodeSummaryMetrics,
-		StoreStatuses: []StoreStatus{
+		StoreStatuses: []statuspb.StoreStatus{
 			{
 				Desc:    storeDesc1,
 				Metrics: expectedStoreSummaryMetrics,
@@ -337,6 +348,8 @@ func TestMetricsRecorder(t *testing.T) {
 				Metrics: expectedStoreSummaryMetrics,
 			},
 		},
+		TotalSystemMemory: totalMemory,
+		NumCpus:           int32(system.NumCPU()),
 	}
 
 	// Make sure there is at least one environment variable that will be
@@ -345,7 +358,7 @@ func TestMetricsRecorder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	nodeSummary := recorder.GetStatusSummary(context.Background())
+	nodeSummary := recorder.GenerateNodeStatus(context.Background())
 	if nodeSummary == nil {
 		t.Fatalf("recorder did not return nodeSummary")
 	}
@@ -357,10 +370,29 @@ func TestMetricsRecorder(t *testing.T) {
 	}
 	nodeSummary.Args = nil
 	nodeSummary.Env = nil
+	nodeSummary.Activity = nil
 	nodeSummary.Latencies = nil
 
 	sort.Sort(byStoreDescID(nodeSummary.StoreStatuses))
 	if a, e := nodeSummary, expectedNodeSummary; !reflect.DeepEqual(a, e) {
 		t.Errorf("recorder did not produce expected NodeSummary; diff:\n %s", pretty.Diff(e, a))
 	}
+
+	// Make sure that all methods other than GenerateNodeStatus can operate in
+	// parallel with each other (i.e. even if recorder.mu is RLocked).
+	recorder.mu.RLock()
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			if _, err := recorder.MarshalJSON(); err != nil {
+				t.Error(err)
+			}
+			_ = recorder.PrintAsText(ioutil.Discard)
+			_ = recorder.GetTimeSeriesData()
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+	recorder.mu.RUnlock()
 }

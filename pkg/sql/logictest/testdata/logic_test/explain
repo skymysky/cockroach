@@ -1,193 +1,24 @@
-# LogicTest: default distsql
+# LogicTest: local local-vec-off local-spec-planning
 
-query ITTT colnames
-EXPLAIN (PLAN) SELECT 1
-----
-Level  Type    Field Description
-0      render
-1      nullrow
+statement ok
+CREATE TABLE t (a INT PRIMARY KEY)
 
-query ITTTTT colnames
-EXPLAIN (PLAN,METADATA) SELECT 1
-----
-Level  Type     Field  Description  Columns  Ordering
-0      render                       ("1")    ="1"
-1      nullrow                      ()
-
-query ITTTTT colnames
-EXPLAIN (METADATA,PLAN) SELECT 1
-----
-Level  Type     Field  Description  Columns  Ordering
-0      render                       ("1")    ="1"
-1      nullrow                      ()
-
+# Hide the line with "vectorized:", which differs depending on the config.
 query T
-SELECT message FROM [SHOW KV TRACE FOR SELECT 1]
- WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+SELECT info FROM [EXPLAIN (DISTSQL) SELECT * FROM (SELECT avg(a) OVER () FROM t)] WHERE info NOT LIKE 'vectorized%'
 ----
-output row: [1]
+distribution: local
+·
+• window
+│
+└── • scan
+      missing stats
+      table: t@primary
+      spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUkF1L8zAUx--fTxEOPKyVyNZd5mpDqxbrOtuyCaMXsTmOQpfUJJ0vo99d1gx0wkQvz__tF7ID81wDgyyMw4ucVPJJkas0uSOr8GEeT6MZ8S6jLM_uY58cMmcu4B1Ovl173CfJIkyJ5zvP-gVZ3oRp6AZnSU7i6DYkgy2WVunqHcX_AVCQSuCMb9AAW0EABYVGqxKNUXov7fpAJF6BjShUsmntXi4olEojsB3YytYIDHL-WGOKXKAejoCCQMurup-1k0ZXG67fgELWcGkYOYeio6Ba-zloLF8jsKCjv4cuKynUC-phcEycLq69SeADhaS1jEzGJ3Hjv-BSNI2SBo9gp5ZHXUEBxRrdPxrV6hLnWpU9xp1J3-sFgcY6N3BHJJ21f-DXcvBjefytXHT_PgIAAP__H3zBmg==
 
-query ITTTTT colnames
-EXPLAIN (TYPES) SELECT 1
-----
-Level  Type     Field     Description  Columns    Ordering
-0      render                          ("1" int)  ="1"
-0               render 0  (1)[int]
-1      nullrow                         ()
-
-statement error cannot set EXPLAIN mode more than once
-EXPLAIN (PLAN,PLAN) SELECT 1
-
-statement error cannot set EXPLAIN mode more than once
-EXPLAIN (PLAN,DISTSQL) SELECT 1
-
-statement error unsupported EXPLAIN option
-EXPLAIN (PLAN,UNKNOWN) SELECT 1
-
-# Ensure that tracing results are sorted after gathering
-query ITTTTT
-EXPLAIN (METADATA) SHOW TRACE FOR SELECT 1
-----
-0  sort                                 ("timestamp", age, message, context, operation, span)                             +"timestamp"
-0                  order  +"timestamp"
-1  window                               ("timestamp", age, message, context, operation, span)
-2  render                               ("timestamp", "timestamp", message, context, operation, span)
-3  window                               ("timestamp", message, context, operation, span)
-4  render                               ("timestamp", message, context, operation, span, txn_idx, span_idx, message_idx)
-5  show trace for                       (txn_idx, span_idx, message_idx, "timestamp", duration, operation, message)
-6  render                               ("1")                                                                             ="1"
-7  nullrow                              ()
-
-# Ensure that all relevant statement types can be explained
-query ITTT
-EXPLAIN CREATE DATABASE foo
-----
-0 create database
-
-query ITTT
-EXPLAIN CREATE TABLE foo (x INT)
-----
-0 create table
-
-statement ok
-CREATE TABLE foo (x INT)
-
-query ITTT
-EXPLAIN CREATE INDEX a ON foo(x)
-----
-0 create index
-
-statement ok
-CREATE DATABASE foo
-
-query ITTT
-EXPLAIN DROP DATABASE foo
-----
-0 drop database
-
-statement ok
-CREATE INDEX a ON foo(x)
-
-query ITTT
-EXPLAIN DROP INDEX foo@a
-----
-0 drop index
-
-query ITTT
-EXPLAIN ALTER TABLE foo ADD COLUMN y INT
-----
-0 alter table
-
-query ITTT
-EXPLAIN (EXPRS) ALTER TABLE foo SPLIT AT VALUES (42)
-----
-0  split
-1  values
-1          size           1 column, 1 row
-1          row 0, expr 0  42
-
-query ITTT
-EXPLAIN DROP TABLE foo
-----
-0 drop table
-
-query ITTT
-EXPLAIN SHOW DATABASES
-----
-0  sort
-0          order  +"Database"
-1  render
-2  values
-2          size   4 columns, 6 rows
-
-query ITTT
-EXPLAIN SHOW TABLES
-----
-0  values
-0          size  1 column, 1 row
-
-query ITTT
-EXPLAIN SHOW DATABASE
-----
-0  values
-0          size  1 column, 1 row
-
-query ITTT
-EXPLAIN SHOW TIME ZONE
-----
-0  values
-0          size  1 column, 1 row
-
-query ITTT
-EXPLAIN SHOW DEFAULT_TRANSACTION_ISOLATION
-----
-0  values
-0          size  1 column, 1 row
-
-query ITTT
-EXPLAIN SHOW TRANSACTION ISOLATION LEVEL
-----
-0  values
-0          size  1 column, 1 row
-
-query ITTT
-EXPLAIN SHOW TRANSACTION PRIORITY
-----
-0  values
-0          size  1 column, 1 row
-
-query ITTT
-EXPLAIN SHOW COLUMNS FROM foo
-----
-0  values
-0          size  5 columns, 1 row
-
-query ITTT
-EXPLAIN SHOW GRANTS ON foo
-----
-0  sort
-0          order  +"Table",+"User",+"Privileges"
-1  values
-1          size   3 columns, 1 row
-
-query ITTT
-EXPLAIN SHOW INDEX FROM foo
-----
-0  values
-0          size  8 columns, 3 rows
-
-query ITTT
-EXPLAIN SHOW CONSTRAINTS FROM foo
-----
-0  sort
-0          order  +"Table",+"Name"
-1  values
-1          size   5 columns, 0 rows
-
-query ITTT
-EXPLAIN SHOW USERS
-----
-0  render
-1  scan
-1        table  users@primary
-1        spans  ALL
+# Test that explaining a query that contains a subquery the result of which is
+# needed to make the physical plan is rejected. See #40677.
+statement error running EXPLAIN \(DISTSQL\) on this query is unsupported because of the presence of subqueries
+EXPLAIN (DISTSQL) SELECT avg(a) OVER (ROWS (SELECT count(*) FROM t) PRECEDING) FROM t

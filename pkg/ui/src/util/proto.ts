@@ -1,9 +1,19 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import _ from "lodash";
 
 import * as protos from "src/js/protos";
 
-export type NodeStatus$Properties = protos.cockroach.server.status.NodeStatus$Properties;
-const nodeStatus: NodeStatus$Properties = null;
+export type INodeStatus = protos.cockroach.server.status.statuspb.INodeStatus;
+const nodeStatus: INodeStatus = null;
 export type StatusMetrics = typeof nodeStatus.metrics;
 
 /**
@@ -12,11 +22,14 @@ export type StatusMetrics = typeof nodeStatus.metrics;
  * collections are accumulated into the first StatusMetrics collection
  * passed.
  */
-export function AccumulateMetrics(dest: StatusMetrics, ...srcs: StatusMetrics[]): void {
+export function AccumulateMetrics(
+  dest: StatusMetrics,
+  ...srcs: StatusMetrics[]
+): void {
   srcs.forEach((s: StatusMetrics) => {
     _.forEach(s, (val: number, key: string) => {
       if (_.has(dest, key)) {
-        dest[key] =  dest[key] + val;
+        dest[key] = dest[key] + val;
       } else {
         dest[key] = val;
       }
@@ -29,14 +42,18 @@ export function AccumulateMetrics(dest: StatusMetrics, ...srcs: StatusMetrics[])
  * metrics collection of the supplied NodeStatus object. This is convenient
  * for all current usages of NodeStatus in the UI.
  */
-export function RollupStoreMetrics(ns: NodeStatus$Properties): void {
-  AccumulateMetrics(ns.metrics, ..._.map(ns.store_statuses, (ss) => ss.metrics));
+export function RollupStoreMetrics(ns: INodeStatus): void {
+  AccumulateMetrics(
+    ns.metrics,
+    ..._.map(ns.store_statuses, (ss) => ss.metrics),
+  );
 }
 
 /**
  * MetricConstants contains the name of several stats provided by
  * CockroachDB.
  */
+// eslint-disable-next-line @typescript-eslint/no-namespace
 export namespace MetricConstants {
   // Store level metrics.
   export const replicas: string = "replicas";
@@ -44,10 +61,11 @@ export namespace MetricConstants {
   export const leaseHolders: string = "replicas.leaseholders";
   export const ranges: string = "ranges";
   export const unavailableRanges: string = "ranges.unavailable";
-  export const underReplicatedRanges: string  = "ranges.underreplicated";
+  export const underReplicatedRanges: string = "ranges.underreplicated";
   export const liveBytes: string = "livebytes";
   export const keyBytes: string = "keybytes";
   export const valBytes: string = "valbytes";
+  export const totalBytes: string = "totalbytes";
   export const intentBytes: string = "intentbytes";
   export const liveCount: string = "livecount";
   export const keyCount: string = "keycount";
@@ -55,9 +73,9 @@ export namespace MetricConstants {
   export const intentCount: string = "intentcount";
   export const intentAge: string = "intentage";
   export const gcBytesAge: string = "gcbytesage";
-  export const lastUpdateNano: string = "lastupdatenanos";
   export const capacity: string = "capacity";
   export const availableCapacity: string = "capacity.available";
+  export const usedCapacity: string = "capacity.used";
   export const sysBytes: string = "sysbytes";
   export const sysCount: string = "syscount";
 
@@ -72,9 +90,12 @@ export namespace MetricConstants {
 /**
  * TotalCPU computes the total CPU usage accounted for in a NodeStatus.
  */
-export function TotalCpu(status: NodeStatus$Properties): number {
+export function TotalCpu(status: INodeStatus): number {
   const metrics = status.metrics;
-  return metrics[MetricConstants.sysCPUPercent] + metrics[MetricConstants.userCPUPercent];
+  return (
+    metrics[MetricConstants.sysCPUPercent] +
+    metrics[MetricConstants.userCPUPercent]
+  );
 }
 
 /**
@@ -86,7 +107,11 @@ const aggregateByteKeys = [
   MetricConstants.sysBytes,
 ];
 
-export function BytesUsed(s: NodeStatus$Properties): number {
+export function BytesUsed(s: INodeStatus): number {
+  const usedCapacity = s.metrics[MetricConstants.usedCapacity];
+  if (usedCapacity !== 0) {
+    return usedCapacity;
+  }
   return _.sumBy(aggregateByteKeys, (key: string) => {
     return s.metrics[key];
   });
