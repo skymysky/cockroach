@@ -1,18 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Andrew Bonventre (andybons@gmail.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package encoding
 
@@ -111,6 +100,12 @@ func TestEncodeFloatOrdered(t *testing.T) {
 				if !math.IsNaN(dec) {
 					t.Errorf("unexpected mismatch for %v. got %v", c.Value, dec)
 				}
+			} else if c.Value == 0 {
+				// Both -0 and +0 should decode as +0. We need to check bit-for-bit
+				// equality to confirm this.
+				if math.Float64bits(dec) != math.Float64bits(0) {
+					t.Errorf("unexpected mismatch for %v, should be +0. got %v", c.Value, dec)
+				}
 			} else if dec != c.Value {
 				t.Errorf("unexpected mismatch for %v. got %v", c.Value, dec)
 			}
@@ -165,7 +160,7 @@ func TestEncodeFloatValue(t *testing.T) {
 }
 
 func BenchmarkEncodeFloat(b *testing.B) {
-	rng, _ := randutil.NewPseudoRand()
+	rng, _ := randutil.NewTestRand()
 
 	vals := make([]float64, 10000)
 	for i := range vals {
@@ -181,7 +176,7 @@ func BenchmarkEncodeFloat(b *testing.B) {
 }
 
 func BenchmarkDecodeFloat(b *testing.B) {
-	rng, _ := randutil.NewPseudoRand()
+	rng, _ := randutil.NewTestRand()
 
 	vals := make([][]byte, 10000)
 	for i := range vals {

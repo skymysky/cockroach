@@ -1,18 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package envutil
 
@@ -22,12 +11,14 @@ import (
 	"os"
 	"os/user"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/redact"
 )
 
 type envVarInfo struct {
@@ -47,10 +38,9 @@ func init() {
 
 func checkVarName(name string) {
 	// Env vars must:
-	//  - start with COCKROACH_
 	//  - be uppercase
 	//  - only contain letters, digits, and _
-	valid := strings.HasPrefix(name, "COCKROACH_")
+	valid := true
 	for i := 0; valid && i < len(name); i++ {
 		c := name[i]
 		valid = ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')
@@ -60,15 +50,51 @@ func checkVarName(name string) {
 	}
 }
 
-// getEnv retrieves an environment variable, keeps track of where
+func checkInternalVarName(name string) {
+	// Env vars must:
+	//  - start with COCKROACH_
+	//  - pass basic validity checks in checkVarName
+	if !strings.HasPrefix(name, "COCKROACH_") {
+		panic("invalid env var name " + name)
+	}
+	checkVarName(name)
+}
+
+func checkExternalVarName(name string) {
+	// Env vars must:
+	//  - not start with COCKROACH_
+	//  - pass basic validity checks in checkVarName
+	if strings.HasPrefix(name, "COCKROACH_") {
+		panic("invalid env var name " + name)
+	}
+	checkVarName(name)
+}
+
+// getEnv performs all of the same actions as getAndCacheEnv but also includes
+// a validity check of the variable name.
+func getEnv(varName string, depth int) (string, bool) {
+	checkInternalVarName(varName)
+	return getAndCacheEnv(varName, depth+1)
+}
+
+// getExternalEnv performs all of the same actions as getEnv but also asserts
+// that the variable is not of the form of an internal environment variable,
+// eg. "COCKROACH_".
+func getExternalEnv(varName string, depth int) (string, bool) {
+	checkExternalVarName(varName)
+	return getAndCacheEnv(varName, depth+1)
+}
+
+// getAndCacheEnv retrieves an environment variable, keeps track of where
 // it was accessed, and checks that each environment variable is accessed
 // from at most one place.
 // The bookkeeping enables a report of all influential environment
 // variables with "cockroach debug env". To keep this report useful,
 // all relevant environment variables should be read during start up.
-func getEnv(varName string, depth int) (string, bool) {
+// This function should not be used directly; getEnv or getExternalEnv should
+// be used instead.
+func getAndCacheEnv(varName string, depth int) (string, bool) {
 	_, consumer, _, _ := runtime.Caller(depth + 1)
-	checkVarName(varName)
 
 	envVarRegistry.mu.Lock()
 	defer envVarRegistry.mu.Unlock()
@@ -112,23 +138,137 @@ func GetEnvReport() string {
 
 // GetEnvVarsUsed returns the names of all environment variables that
 // may have been used.
-func GetEnvVarsUsed() []string {
+func GetEnvVarsUsed() (result []redact.RedactableString) {
+	allVarsRaw := os.Environ()
+	sort.Strings(allVarsRaw)
+	allVarsValues := make(map[redact.SafeString]string, len(allVarsRaw))
+	allVarNames := make([]redact.SafeString, 0, len(allVarsRaw))
+	for _, v := range allVarsRaw {
+		i := strings.IndexByte(v, '=')
+		if i < 0 {
+			continue
+		}
+		varName := redact.SafeString(v[:i])
+		allVarNames = append(allVarNames, varName)
+		var value string
+		if i+1 < len(v) {
+			value = v[i+1:]
+		}
+		allVarsValues[varName] = value
+	}
+
 	envVarRegistry.mu.Lock()
 	defer envVarRegistry.mu.Unlock()
 
-	var vars []string
-	for k, v := range envVarRegistry.cache {
-		if v.present {
-			vars = append(vars, k+"="+os.Getenv(k))
+	for _, varName := range allVarNames {
+		_, crdbVar := envVarRegistry.cache[string(varName)]
+		_, safeVar := safeVarRegistry[varName]
+		if crdbVar || safeVar {
+			result = append(result, redact.Sprintf("%s=%s", varName, redact.SafeString(allVarsValues[varName])))
+		} else if _, reportable := valueReportableUnsafeVarRegistry[varName]; reportable {
+			result = append(result, redact.Sprintf("%s=%s", varName, allVarsValues[varName]))
+		} else if _, reportable := nameReportableUnsafeVarRegistry[varName]; reportable {
+			result = append(result, redact.Sprintf("%s=...", varName))
 		}
+		// For any env var just the name could contain too many sensitive details and we
+		// don't really want them to show up in logs.
 	}
 
-	for _, name := range []string{"GOGC", "GODEBUG", "GOMAXPROCS", "GOTRACEBACK"} {
-		if val, ok := os.LookupEnv(name); ok {
-			vars = append(vars, name+"="+val)
-		}
-	}
-	return vars
+	return result
+}
+
+// safeVarRegistry is the list of variables where we can both report
+// the name and the value safely: the value is known to never contain
+// sensitive information.
+var safeVarRegistry = map[redact.SafeString]struct{}{
+	// Go runtime.
+	"GOGC":        {},
+	"GODEBUG":     {},
+	"GOMAXPROCS":  {},
+	"GOTRACEBACK": {},
+	"GOMEMLIMIT":  {},
+	// Jemalloc configuration override.
+	"MALLOC_CONF": {},
+	// gRPC.
+	"GRPC_GO_LOG_SEVERITY_LEVEL":  {},
+	"GRPC_GO_LOG_VERBOSITY_LEVEL": {},
+	// general
+	"LANG": {},
+	"TERM": {},
+}
+
+// valueReportableUnsafeVarRegistry is the list of variables where we can
+// report the name safely, and the value as a redactable payload.
+// The value may contain sensitive information, but not so sensitive
+// that users would be unhappy to see them enclosed within redaction
+// markers in log files.
+var valueReportableUnsafeVarRegistry = map[redact.SafeString]struct{}{
+	"DEBUG_HTTP2_GOROUTINES": {},
+	"HOST_IP":                {},
+	"LANG":                   {},
+	"LC_ALL":                 {},
+	"LC_COLLATE":             {},
+	"LC_CTYPE":               {},
+	"LC_TIME":                {},
+	"LC_NUMERIC":             {},
+	"LC_MESSAGES":            {},
+	"LS_METRICS_ENABLED":     {},
+	"TERM":                   {},
+	"TZ":                     {},
+	"ZONEINFO":               {},
+	// From the Go runtime.
+	"LOCALDOMAIN":    {},
+	"RES_OPTIONS":    {},
+	"HOSTALIASES":    {},
+	"HTTP_PROXY":     {},
+	"HTTPS_PROXY":    {},
+	"NO_PROXY":       {},
+	"REQUEST_METHOD": {},
+}
+
+// nameReportableUnsafeVarRegistry is the list of variables where we can
+// report the name safely, but not the value in any form because it is
+// too likely to contain an unsafe payload that users would be horrified
+// to see in a log file, redaction markers or not.
+var nameReportableUnsafeVarRegistry = map[redact.SafeString]struct{}{
+	// GCP.
+	"GOOGLE_API_USE_MTLS":  {},
+	"GOOGLE_CLOUD_PROJECT": {},
+	// AWS.
+	"AWS_ACCESS_KEY":              {},
+	"AWS_ACCESS_KEY_ID":           {},
+	"AWS_PROFILE":                 {},
+	"AWS_REGION":                  {},
+	"AWS_SDK_LOAD_CONFIG":         {},
+	"AWS_SECRET_ACCESS_KEY":       {},
+	"AWS_SECRET_KEY":              {},
+	"AWS_SESSION_TOKEN":           {},
+	"AWS_SHARED_CREDENTIALS_FILE": {},
+	// Azure.
+	"AZURE_ACCESS_TOKEN_FILE": {},
+	"AZURE_AUTH_LOCATION":     {},
+	"AZURE_CONFIG_DIR":        {},
+	"AZURE_GO_SDK_LOG_FILE":   {},
+	"AZURE_GO_SDK_LOG_LEVEL":  {},
+	// Google auth.
+	"GAE_APPLICATION":     {},
+	"GAE_DEPLOYMENT_ID":   {},
+	"GAE_ENV":             {},
+	"GAE_INSTANCE":        {},
+	"GAE_LONG_APP_ID":     {},
+	"GAE_MINOR_VERSION":   {},
+	"GAE_MODULE_INSTANCE": {},
+	"GAE_MODULE_NAME":     {},
+	"GAE_PARTITION":       {},
+	"GAE_SERVICE":         {},
+	// Kerberos.
+	"KRB5CCNAME": {},
+	// Pprof.
+	"PPROF_BINARY_PATH": {},
+	"PPROF_TMPDIR":      {},
+	"PPROF_TOOLS":       {},
+	// Sentry-go.
+	"SENTRY_RELEASE": {},
 }
 
 // GetShellCommand returns a complete command to run with a prefix of the command line.
@@ -168,6 +308,16 @@ func EnvString(name string, depth int) (string, bool) {
 	return getEnv(name, depth+1)
 }
 
+// ExternalEnvString returns the value set by the specified environment
+// variable. Only non-CRDB environment variables should be accessed via this
+// method. CRDB specific variables should be accessed via EnvString. The depth
+// argument indicates the stack depth of the caller that should be associated
+// with the variable. The returned boolean flag indicates if the variable is
+// set.
+func ExternalEnvString(name string, depth int) (string, bool) {
+	return getExternalEnv(name, depth+1)
+}
+
 // EnvOrDefaultString returns the value set by the specified
 // environment variable, if any, otherwise the specified default
 // value.
@@ -180,6 +330,19 @@ func EnvOrDefaultString(name string, value string) string {
 
 // EnvOrDefaultBool returns the value set by the specified environment
 // variable, if any, otherwise the specified default value.
+//
+// N.B. EnvOrDefaultBool has the desired side-effect of populating envVarRegistry.cache.
+// It has to be invoked during (var) init; otherwise, cli/start.go:reportConfiguration will not report the
+// value of this environment variable in the server log, upon startup.
+//
+//	Correct Usage: var allowUpgradeToDev = envutil.EnvOrDefaultBool("COCKROACH_UPGRADE_TO_DEV_VERSION", false)
+//
+//	Incorrect Usage: func() {
+//											...
+//											var allowUpgradeToDev envutil.EnvOrDefaultBool("COCKROACH_UPGRADE_TO_DEV_VERSION", false)
+//										}
+//
+// N.B. The same rule applies to the remaining EnvOrDefaultXXX defined here.
 func EnvOrDefaultBool(name string, value bool) bool {
 	if str, present := getEnv(name, 1); present {
 		v, err := strconv.ParseBool(str)
@@ -217,6 +380,21 @@ func EnvOrDefaultInt64(name string, value int64) int64 {
 	return value
 }
 
+// EnvOrDefaultFloat64 returns the value set by the specified environment
+// variable, if any, otherwise the specified default value.
+func EnvOrDefaultFloat64(name string, value float64) float64 {
+	if str, present := getEnv(name, 1); present {
+		v, err := strconv.ParseFloat(str, 64)
+		if err != nil {
+			panic(fmt.Sprintf("error parsing %s: %s", name, err))
+		}
+		return v
+	}
+	return value
+}
+
+var _ = EnvOrDefaultFloat64 // silence unused warning
+
 // EnvOrDefaultBytes returns the value set by the specified environment
 // variable, if any, otherwise the specified default value.
 func EnvOrDefaultBytes(name string, value int64) int64 {
@@ -241,4 +419,56 @@ func EnvOrDefaultDuration(name string, value time.Duration) time.Duration {
 		return v
 	}
 	return value
+}
+
+// TB is a slimmed down version of testing.T for use below.
+// We would like to use testutils.TB but this is not possible
+// due to a dependency cycle.
+type TB interface {
+	Fatal(args ...interface{})
+	Helper()
+}
+
+// TestSetEnv sets an environment variable and the cleanup function
+// resets it to the original value.
+func TestSetEnv(t TB, name string, value string) func() {
+	t.Helper()
+	ClearEnvCache()
+	before, exists := os.LookupEnv(name)
+
+	if err := os.Setenv(name, value); err != nil {
+		t.Fatal(err)
+	}
+	return func() {
+		if exists {
+			if err := os.Setenv(name, before); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			if err := os.Unsetenv(name); err != nil {
+				t.Fatal(err)
+			}
+		}
+		ClearEnvCache()
+	}
+}
+
+// TestUnsetEnv unsets an environment variable and the cleanup function
+// resets it to the original value.
+func TestUnsetEnv(t TB, name string) func() {
+	t.Helper()
+	ClearEnvCache()
+	before, exists := os.LookupEnv(name)
+	if !exists {
+		return func() {}
+	}
+	if err := os.Unsetenv(name); err != nil {
+		t.Fatal(err)
+	}
+	return func() {
+		if err := os.Setenv(name, before); err != nil {
+			t.Fatal(err)
+		}
+		ClearEnvCache()
+	}
 }

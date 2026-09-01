@@ -1,26 +1,16 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/errors"
 )
 
 // delayedNode wraps a planNode in cases where the planNode
@@ -28,20 +18,60 @@ import (
 // SQL prepare) for resource tracking purposes.
 type delayedNode struct {
 	name        string
-	columns     sqlbase.ResultColumns
+	columns     colinfo.ResultColumns
 	constructor nodeConstructor
-	plan        planNode
+	input       planNode
 }
 
 type nodeConstructor func(context.Context, *planner) (planNode, error)
 
+func (d *delayedNode) Next(params runParams) (bool, error) { return d.input.Next(params) }
+func (d *delayedNode) Values() tree.Datums                 { return d.input.Values() }
+
 func (d *delayedNode) Close(ctx context.Context) {
-	if d.plan != nil {
-		d.plan.Close(ctx)
-		d.plan = nil
+	if d.input != nil {
+		d.input.Close(ctx)
+		d.input = nil
 	}
 }
 
-func (d *delayedNode) Start(ctx context.Context) error        { return d.plan.Start(ctx) }
-func (d *delayedNode) Next(ctx context.Context) (bool, error) { return d.plan.Next(ctx) }
-func (d *delayedNode) Values() parser.Datums                  { return d.plan.Values() }
+func (n *delayedNode) InputCount() int {
+	if n.input != nil {
+		return 1
+	}
+	return 0
+}
+
+func (n *delayedNode) Input(i int) (planNode, error) {
+	if i == 0 && n.input != nil {
+		return n.input, nil
+	}
+	return nil, errors.AssertionFailedf("input index %d is out of range", i)
+}
+
+func (n *delayedNode) SetInput(i int, p planNode) error {
+	if i == 0 && n.input != nil {
+		n.input = p
+		return nil
+	}
+	return errors.AssertionFailedf("input index %d is out of range", i)
+}
+
+// startExec constructs the wrapped planNode now that execution is underway.
+func (d *delayedNode) startExec(params runParams) error {
+	if d.input != nil {
+		panic("wrapped input should not yet exist")
+	}
+
+	plan, err := d.constructor(params.ctx, params.p)
+	if err != nil {
+		return err
+	}
+	d.input = plan
+
+	// Recursively invoke startExec on new plan. Normally, startExec doesn't
+	// recurse - calling children is handled by the planNode walker. The reason
+	// this won't suffice here is that the child of this node doesn't exist
+	// until after startExec is invoked.
+	return startExec(params, plan)
+}

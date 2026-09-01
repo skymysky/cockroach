@@ -1,46 +1,17 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package caller
 
 import (
-	"fmt"
 	"path"
-	"regexp"
+	"runtime"
 	"testing"
-)
 
-func TestCallResolver(t *testing.T) {
-	cr := NewCallResolver(regexp.MustCompile(`resolver_test\.go.*$`))
-	// Also test that caching doesn't have obvious hiccups.
-	for i := 0; i < 2; i++ {
-		if l := len(cr.cache); l != i {
-			t.Fatalf("cache has %d entries, expected %d", l, i)
-		}
-		file, _, fun := func() (string, int, string) {
-			return cr.Lookup(1)
-		}()
-		if file != "resolver_test.go" {
-			t.Fatalf("wrong file '%s'", file)
-		}
-		if fun != "TestCallResolver" {
-			t.Fatalf("unexpected caller reported: %s", fun)
-		}
-	}
-}
+	"github.com/stretchr/testify/require"
+)
 
 func TestDefaultCallResolver(t *testing.T) {
 	defer func() { defaultCallResolver.cache = map[uintptr]*cachedLookup{} }()
@@ -50,6 +21,8 @@ func TestDefaultCallResolver(t *testing.T) {
 			t.Fatalf("cache has %d entries, expected %d", l, i)
 		}
 		file, _, fun := Lookup(0)
+		_, runFile, _, _ := runtime.Caller(0)
+		t.Logf("%s %s (from %s)", file, fun, runFile)
 		if fun != "TestDefaultCallResolver" {
 			t.Fatalf("unexpected caller reported: %s", fun)
 		}
@@ -61,22 +34,60 @@ func TestDefaultCallResolver(t *testing.T) {
 	}
 }
 
-func BenchmarkFormattedCaller(b *testing.B) {
+func BenchmarkSimpleCaller(b *testing.B) {
+	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		file, line, _ := Lookup(1)
-		s := fmt.Sprintf("%s:%d", file, line)
-		if testing.Verbose() {
-			b.Log(s)
-		}
+		_, _, _ = Lookup(1)
 	}
 }
 
-func BenchmarkSimpleCaller(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		file, line, _ := Lookup(1)
-		if testing.Verbose() {
-			s := fmt.Sprintf("%s:%d", file, line)
-			b.Log(s)
-		}
+func Test_parseFQFun(t *testing.T) {
+	tests := []struct {
+		fqFun  string
+		expPkg string
+		expFun string
+	}{
+		{
+			fqFun:  "github.com/foo/bar/baz.(*Something).Else",
+			expPkg: "github.com/foo/bar/baz",
+			expFun: "(*Something).Else",
+		},
+		{
+			fqFun:  "github.com/foo/bar/baz.Else",
+			expPkg: "github.com/foo/bar/baz",
+			expFun: "Else",
+		},
+		{
+			fqFun:  "github.com/foo/bar/baz..func1",
+			expPkg: "github.com/foo/bar/baz",
+			expFun: ".func1",
+		},
+		{
+			fqFun:  "main.(*Bar).Baz",
+			expPkg: "main",
+			expFun: "(*Bar).Baz",
+		},
+		{
+			fqFun:  "main.init",
+			expPkg: "main",
+			expFun: "init",
+		},
+		{
+			fqFun:  "github.com/cockroachdb/cockroach/pkg/kv/kvserver.(*Replica).Foo",
+			expPkg: "kv/kvserver", // special-cased prefix was stripped
+			expFun: "(*Replica).Foo",
+		},
+		{
+			fqFun:  "github.com/cockroachdb/pebble/foo.Bar",
+			expPkg: "pebble/foo", // special-cased prefix was stripped
+			expFun: "Bar",
+		},
+	}
+	for _, tt := range tests {
+		t.Run("", func(t *testing.T) {
+			pkg, fun := parseFQFun(tt.fqFun)
+			require.Equal(t, tt.expPkg, pkg)
+			require.Equal(t, tt.expFun, fun)
+		})
 	}
 }

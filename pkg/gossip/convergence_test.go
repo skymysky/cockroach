@@ -1,28 +1,16 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package gossip_test
 
 import (
+	"context"
 	"testing"
 
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/gossip/simulation"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -59,24 +47,22 @@ func connectionsRefused(network *simulation.Network) int64 {
 // As of Jan 2017, this normally takes ~12 cycles and 8-12 refused connections.
 func TestConvergence(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	if testutils.Stress() {
-		t.Skip()
-	}
+	skip.UnderStress(t)
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 
 	network := simulation.NewNetwork(stopper, testConvergenceSize, true)
 
 	const maxCycles = 100
 	if connectedCycle := network.RunUntilFullyConnected(); connectedCycle > maxCycles {
-		log.Warningf(context.Background(), "expected a fully-connected network within %d cycles; took %d",
+		log.Dev.Warningf(context.Background(), "expected a fully-connected network within %d cycles; took %d",
 			maxCycles, connectedCycle)
 	}
 
 	const maxConnsRefused = 50
 	if connsRefused := connectionsRefused(network); connsRefused > maxConnsRefused {
-		log.Warningf(context.Background(),
+		log.Dev.Warningf(context.Background(),
 			"expected network to fully connect with <= %d connections refused; took %d",
 			maxConnsRefused, connsRefused)
 	}
@@ -92,12 +78,10 @@ func TestConvergence(t *testing.T) {
 // As of Jan 2017, this normally takes 8-9 cycles and 50-60 refused connections.
 func TestNetworkReachesEquilibrium(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	if testutils.Stress() {
-		t.Skip()
-	}
+	skip.UnderStress(t)
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 
 	network := simulation.NewNetwork(stopper, testReachesEquilibriumSize, true)
 
@@ -114,7 +98,7 @@ func TestNetworkReachesEquilibrium(t *testing.T) {
 			cyclesWithoutChange++
 		}
 		if cycle%5 == 0 {
-			log.Infof(context.Background(), "cycle: %d, cyclesWithoutChange: %d, fullyConnected: %v",
+			log.Dev.Infof(context.Background(), "cycle: %d, cyclesWithoutChange: %d, fullyConnected: %v",
 				cycle, cyclesWithoutChange, network.IsNetworkConnected())
 		}
 		return cyclesWithoutChange < 5
@@ -122,13 +106,13 @@ func TestNetworkReachesEquilibrium(t *testing.T) {
 
 	const maxCycles = 200
 	if numCycles > maxCycles {
-		log.Warningf(context.Background(), "expected a non-thrashing network within %d cycles; took %d",
+		log.Dev.Warningf(context.Background(), "expected a non-thrashing network within %d cycles; took %d",
 			maxCycles, numCycles)
 	}
 
 	const maxConnsRefused = 500
 	if connsRefused > maxConnsRefused {
-		log.Warningf(context.Background(),
+		log.Dev.Warningf(context.Background(),
 			"expected thrashing to die down with <= %d connections refused; took %d",
 			maxConnsRefused, connsRefused)
 	}

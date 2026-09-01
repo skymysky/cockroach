@@ -4,7 +4,7 @@ source [file join [file dirname $argv0] common.tcl]
 
 start_server $argv
 
-spawn $argv sql
+spawn $argv sql --no-line-editor
 eexpect root@
 
 start_test "Check that syntax errors are handled client-side when running interactive."
@@ -25,6 +25,13 @@ eexpect COMMIT
 eexpect root@
 end_test
 
+start_test "Check that the syntax checker does not get confused by empty inputs."
+# (issue #22441.)
+send ";\r"
+eexpect "OK"
+eexpect root@
+end_test
+
 start_test "Check that the user can force server-side handling."
 send "\\unset check_syntax\r"
 eexpect root@
@@ -33,7 +40,8 @@ send "begin;\r"
 eexpect BEGIN
 
 send "select 3+;\r"
-eexpect "pq: syntax error"
+eexpect "ERROR: at or near"
+eexpect "syntax error"
 eexpect root@
 
 send "select 1;\r"
@@ -44,7 +52,7 @@ send "commit;\r"
 eexpect "ROLLBACK"
 eexpect root@
 
-interrupt
+send_eof
 eexpect eof
 end_test
 
@@ -57,16 +65,43 @@ send "(echo '\\unset errexit'; echo 'begin;'; echo 'select 1+;'; echo 'select 1;
 eexpect "syntax error"
 eexpect "current transaction is aborted"
 eexpect ":/# "
-send "echo \$?\r"
-eexpect "1\r\n:/# "
+send "echo ::\$?::\r"
+eexpect "::1::"
+eexpect ":/# "
 
 send "(echo '\\unset errexit'; echo '\\set check_syntax'; echo 'begin;'; echo 'select 1+;'; echo 'select 1;'; echo 'commit;') | $argv sql\r"
 eexpect "syntax error"
 eexpect "1 row"
 eexpect "COMMIT"
 eexpect ":/# "
-send "echo \$?\r"
-eexpect "0\r\n:/# "
+send "echo ::\$?::\r"
+eexpect "::0::"
+eexpect ":/# "
+end_test
+
+start_test "Check that --debug-sql-cli sets suitable simplified client-side options."
+send "$argv sql --debug-sql-cli --no-line-editor\r"
+eexpect "Welcome"
+
+# Check empty db name for build info query.
+eexpect "\"\".crdb_internal.node_build_info"
+# Check invitation to reset db name.
+eexpect "you might want to set the current database"
+eexpect "to the empty string"
+
+# Check that troubleshooting mode is enabled in debug mode.
+eexpect "root@"
+send "show troubleshooting_mode;\r"
+eexpect "on"
+
+eexpect "root@"
+send "\\set display_format csv\r\\set\r"
+eexpect "check_syntax,false"
+eexpect "echo,true"
+eexpect "prompt1,%n@%M:%> %C>"
+eexpect "root@"
+send "\\q\r"
+eexpect ":/# "
 end_test
 
 send "exit 0\r"

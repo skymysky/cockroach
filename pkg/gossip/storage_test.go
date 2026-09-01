@@ -1,33 +1,19 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package gossip_test
 
 import (
+	"context"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
 	"github.com/cockroachdb/cockroach/pkg/gossip/simulation"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -35,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 )
 
 type testStorage struct {
@@ -101,7 +88,7 @@ func (s unresolvedAddrSlice) Swap(i, j int) {
 func TestGossipStorage(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 
 	network := simulation.NewNetwork(stopper, 3, true)
 
@@ -158,7 +145,7 @@ func TestGossipStorage(t *testing.T) {
 		p.Unlock()
 	}
 
-	// Create an unaffiliated gossip node with only itself as a resolver,
+	// Create an unaffiliated gossip node with only itself as an address,
 	// leaving it no way to reach the gossip network.
 	node, err := network.CreateNode()
 	if err != nil {
@@ -166,11 +153,7 @@ func TestGossipStorage(t *testing.T) {
 	}
 	node.Gossip.SetBootstrapInterval(1 * time.Millisecond)
 
-	r, err := resolver.NewResolverFromAddress(node.Addr())
-	if err != nil {
-		t.Fatal(err)
-	}
-	node.Resolvers = []resolver.Resolver{r}
+	node.Addresses = []util.UnresolvedAddr{util.MakeUnresolvedAddr("tcp", node.Addr().String())}
 	if err := network.StartNode(node); err != nil {
 		t.Fatal(err)
 	}
@@ -213,12 +196,12 @@ func TestGossipStorage(t *testing.T) {
 	})
 }
 
-// TestGossipStorageCleanup verifies that bad resolvers are purged
+// TestGossipStorageCleanup verifies that bad addresses are purged
 // from the bootstrap info after gossip has successfully connected.
 func TestGossipStorageCleanup(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 
 	const numNodes = 3
 	network := simulation.NewNetwork(stopper, numNodes, false)
@@ -266,7 +249,7 @@ func TestGossipStorageCleanup(t *testing.T) {
 			}
 			for _, addr := range p.Info().Addresses {
 				if addr.String() == invalidAddr {
-					return errors.Errorf("node %d still needs bootstrap cleanup", i)
+					return errors.Errorf("n%d still needs bootstrap cleanup", i)
 				}
 			}
 		}

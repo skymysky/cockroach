@@ -1,44 +1,71 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: David Taylor (david@cockroachlabs.com)
-// Author: Andrei Matei (andrei@cockroachlabs.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package testcluster
 
 import (
+	"context"
+	"strconv"
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/listenerutil"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/stretchr/testify/require"
 )
+
+func TestClusterStart(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	tc := StartTestCluster(t, 3, base.TestClusterArgs{})
+	defer tc.Stopper().Stop(context.Background())
+}
+
+func TestClusterSqlDisabled(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	var testTypes = []base.DefaultTestTenantOptions{base.TestTenantAlwaysEnabled, base.TestIsSpecificToStorageLayerAndNeedsASystemTenant}
+	testutils.RunTrueAndFalse(t, "disable-sql", func(t *testing.T, disableSQL bool) {
+		testutils.RunValues(t, "test-tenant", testTypes, func(t *testing.T, testTenant base.DefaultTestTenantOptions) {
+			if disableSQL && testTenant == base.TestTenantAlwaysEnabled {
+				// In this combination, it will both fatal and set t.Fail which
+				// is not recoverable. Ideally we could validate this error
+				// occurs, but there isn't an easy way to handle this.
+				skip.IgnoreLint(t)
+				return
+			}
+			tc := StartTestCluster(t, 3,
+				base.TestClusterArgs{
+					ServerArgs: base.TestServerArgs{
+						DefaultTestTenant: testTenant,
+						DisableSQLServer:  disableSQL,
+					},
+				})
+			defer tc.Stopper().Stop(context.Background())
+		})
+	})
+}
 
 func TestManualReplication(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	t.Skip("#13502")
+	defer log.Scope(t).Close(t)
 
 	tc := StartTestCluster(t, 3,
 		base.TestClusterArgs{
@@ -47,72 +74,70 @@ func TestManualReplication(t *testing.T) {
 				UseDatabase: "t",
 			},
 		})
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
-	s0 := sqlutils.MakeSQLRunner(t, tc.Conns[0])
-	s1 := sqlutils.MakeSQLRunner(t, tc.Conns[1])
-	s2 := sqlutils.MakeSQLRunner(t, tc.Conns[2])
+	s0 := sqlutils.MakeSQLRunner(tc.Conns[0])
+	s1 := sqlutils.MakeSQLRunner(tc.Conns[1])
+	s2 := sqlutils.MakeSQLRunner(tc.Conns[2])
 
-	s0.Exec(`CREATE DATABASE t`)
-	s0.Exec(`CREATE TABLE test (k INT PRIMARY KEY, v INT)`)
-	s0.Exec(`INSERT INTO test VALUES (5, 1), (4, 2), (1, 2)`)
+	s0.Exec(t, `CREATE DATABASE t`)
+	s0.Exec(t, `CREATE TABLE test (k INT PRIMARY KEY, v INT)`)
+	s0.Exec(t, `INSERT INTO test VALUES (5, 1), (4, 2), (1, 2)`)
 
-	if r := s1.Query(`SELECT * FROM test WHERE k = 5`); !r.Next() {
+	if r := s1.Query(t, `SELECT * FROM test WHERE k = 5`); !r.Next() {
 		t.Fatal("no rows")
 	} else {
 		r.Close()
 	}
 
-	s2.ExecRowsAffected(3, `DELETE FROM test`)
+	s2.ExecRowsAffected(t, 3, `DELETE FROM test`)
 
 	// Split the table to a new range.
-	kvDB := tc.Servers[0].DB()
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	ts := tc.Server(0).ApplicationLayer()
+	kvDB := ts.DB()
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, ts.Codec(), "t", "test")
 
-	tableStartKey := keys.MakeRowSentinelKey(keys.MakeTablePrefix(uint32(tableDesc.ID)))
+	tableStartKey := ts.Codec().TablePrefix(uint32(tableDesc.GetID()))
 	leftRangeDesc, tableRangeDesc, err := tc.SplitRange(tableStartKey)
 	if err != nil {
 		t.Fatal(err)
 	}
-	log.Infof(context.Background(), "After split got ranges: %+v and %+v.", leftRangeDesc, tableRangeDesc)
-	if len(tableRangeDesc.Replicas) == 0 {
+	log.Dev.Infof(context.Background(), "After split got ranges: %+v and %+v.", leftRangeDesc, tableRangeDesc)
+	if len(tableRangeDesc.InternalReplicas) == 0 {
 		t.Fatalf(
-			"expected replica on node 1, got no replicas: %+v", tableRangeDesc.Replicas)
+			"expected replica on node 1, got no replicas: %+v", tableRangeDesc.InternalReplicas)
 	}
-	if tableRangeDesc.Replicas[0].NodeID != 1 {
+	if tableRangeDesc.InternalReplicas[0].NodeID != 1 {
 		t.Fatalf(
-			"expected replica on node 1, got replicas: %+v", tableRangeDesc.Replicas)
+			"expected replica on node 1, got replicas: %+v", tableRangeDesc.InternalReplicas)
 	}
 
 	// Replicate the table's range to all the nodes.
-	tableRangeDesc, err = tc.AddReplicas(
+	tableRangeDesc, err = tc.AddVoters(
 		tableRangeDesc.StartKey.AsRawKey(), tc.Target(1), tc.Target(2),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tableRangeDesc.Replicas) != 3 {
-		t.Fatalf("expected 3 replicas, got %+v", tableRangeDesc.Replicas)
+	if len(tableRangeDesc.InternalReplicas) != 3 {
+		t.Fatalf("expected 3 replicas, got %+v", tableRangeDesc.InternalReplicas)
 	}
 	for i := 0; i < 3; i++ {
+		sl := tc.Servers[i].StorageLayer()
 		if _, ok := tableRangeDesc.GetReplicaDescriptor(
-			tc.Servers[i].GetFirstStoreID()); !ok {
+			sl.GetFirstStoreID()); !ok {
 			t.Fatalf("expected replica on store %d, got %+v",
-				tc.Servers[i].GetFirstStoreID(), tableRangeDesc.Replicas)
+				sl.GetFirstStoreID(), tableRangeDesc.InternalReplicas)
 		}
 	}
 
-	// Transfer the lease to node 1.
-	leaseHolder, err := tc.FindRangeLeaseHolder(
-		tableRangeDesc,
-		&roachpb.ReplicationTarget{
-			NodeID:  tc.Servers[0].GetNode().Descriptor.NodeID,
-			StoreID: tc.Servers[0].GetFirstStoreID(),
-		})
+	// Transfer the lease to node 2.
+	target := tc.Target(0)
+	leaseHolder, err := tc.FindRangeLeaseHolder(tableRangeDesc, &target)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if leaseHolder.StoreID != tc.Servers[0].GetFirstStoreID() {
+	if leaseHolder.StoreID != tc.Servers[0].StorageLayer().GetFirstStoreID() {
 		t.Fatalf("expected initial lease on server idx 0, but is on node: %+v",
 			leaseHolder)
 	}
@@ -125,19 +150,20 @@ func TestManualReplication(t *testing.T) {
 	// Check that the lease holder has changed. We'll use the old lease holder as
 	// the hint, since it's guaranteed that the old lease holder has applied the
 	// new lease.
-	leaseHolder, err = tc.FindRangeLeaseHolder(
-		tableRangeDesc,
-		&roachpb.ReplicationTarget{
-			NodeID:  tc.Servers[0].GetNode().Descriptor.NodeID,
-			StoreID: tc.Servers[0].GetFirstStoreID(),
-		})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if leaseHolder.StoreID != tc.Servers[1].GetFirstStoreID() {
+	// We wrap this in a SucceedsSoon because N2 might have not applied the lease
+	// yet, it might think that the N1 is the current leaseholder, and the lease
+	// might be INVALID if the time is close to the lease expiration time, or in
+	// the case of leader leases, N2 might not be able to determine the validity
+	// of the lease all together.
+	testutils.SucceedsSoon(t, func() error {
+		leaseHolder, err = tc.FindRangeLeaseHolder(tableRangeDesc, &target)
+		return err
+	})
+
+	if leaseHolder.StoreID != tc.Servers[1].StorageLayer().GetFirstStoreID() {
 		t.Fatalf("expected lease on server idx 1 (node: %d store: %d), but is on node: %+v",
-			tc.Servers[1].GetNode().Descriptor.NodeID,
-			tc.Servers[1].GetFirstStoreID(),
+			tc.Server(1).NodeID(),
+			tc.Server(1).GetFirstStoreID(),
 			leaseHolder)
 	}
 }
@@ -146,16 +172,23 @@ func TestManualReplication(t *testing.T) {
 // waiting for all of the stores to initialize.
 func TestBasicManualReplication(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	tc := StartTestCluster(t, 3, base.TestClusterArgs{ReplicationMode: base.ReplicationManual})
-	defer tc.Stopper().Stop(context.TODO())
+	tc := StartTestCluster(t, 3, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+			DisableSQLServer:  true,
+		},
+		ReplicationMode: base.ReplicationManual,
+	})
+	defer tc.Stopper().Stop(context.Background())
 
-	desc, err := tc.AddReplicas(keys.MinKey, tc.Target(1), tc.Target(2))
+	desc, err := tc.AddVoters(keys.MinKey, tc.Target(1), tc.Target(2))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if expected := 3; expected != len(desc.Replicas) {
-		t.Fatalf("expected %d replicas, got %+v", expected, desc.Replicas)
+	if expected := 3; expected != len(desc.InternalReplicas) {
+		t.Fatalf("expected %d replicas, got %+v", expected, desc.InternalReplicas)
 	}
 
 	if err := tc.TransferRangeLease(desc, tc.Target(1)); err != nil {
@@ -167,59 +200,65 @@ func TestBasicManualReplication(t *testing.T) {
 	// for the lease to timeout which takes ~9s. Testing leaseholder removal is
 	// not necessary because internal rebalancing avoids ever removing the
 	// leaseholder for the exact reason that it causes performance hiccups.
-	desc, err = tc.RemoveReplicas(desc.StartKey.AsRawKey(), tc.Target(0))
+	desc, err = tc.RemoveVoters(desc.StartKey.AsRawKey(), tc.Target(0))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if expected := 2; expected != len(desc.Replicas) {
-		t.Fatalf("expected %d replicas, got %+v", expected, desc.Replicas)
+	if expected := 2; expected != len(desc.InternalReplicas) {
+		t.Fatalf("expected %d replicas, got %+v", expected, desc.InternalReplicas)
 	}
 }
 
 func TestBasicAutoReplication(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	tc := StartTestCluster(t, 3, base.TestClusterArgs{ReplicationMode: base.ReplicationAuto})
-	defer tc.Stopper().Stop(context.TODO())
+	tc := StartTestCluster(t, 3, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+			DisableSQLServer:  true,
+		},
+		ReplicationMode: base.ReplicationAuto,
+	})
+	defer tc.Stopper().Stop(context.Background())
 	// NB: StartTestCluster will wait for full replication.
 }
 
 func TestStopServer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	// Use insecure mode so our servers listen on util.IsolatedTestAddr
-	// and they fail cleanly instead of interfering with other tests.
-	// See https://github.com/cockroachdb/cockroach/issues/9256
 	tc := StartTestCluster(t, 3, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
-			Insecure: true,
+			DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+
+			// We use Insecure: true because the .GetAdminHTTPClient() API
+			// does not currently work when called from two different servers
+			// in the same TestCluster.
+			Insecure:         true,
+			DisableSQLServer: true,
 		},
 		ReplicationMode: base.ReplicationAuto,
 	})
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	// Connect to server 1, ensure it is answering requests over HTTP and GRPC.
-	server1 := tc.Server(1)
+	server1 := tc.Server(1).SystemLayer()
 	var response serverpb.JSONResponse
 
-	httpClient1, err := server1.GetHTTPClient()
+	httpClient1, err := server1.GetUnauthenticatedHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
-	url := server1.AdminURL() + "/_status/metrics/local"
+	url := server1.AdminURL().WithPath("/_status/metrics/local").String()
 	if err := httputil.GetJSON(httpClient1, url, &response); err != nil {
 		t.Fatal(err)
 	}
 
-	rpcContext := rpc.NewContext(
-		log.AmbientContext{}, tc.Server(1).RPCContext().Config, tc.Server(1).Clock(), tc.Stopper(),
-	)
-	conn, err := rpcContext.GRPCDial(server1.ServingAddr())
-	if err != nil {
-		t.Fatal(err)
-	}
-	statusClient1 := serverpb.NewStatusClient(conn)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx := context.Background()
+	statusClient1 := server1.GetStatusClient(t)
+	var cancel func()
+	ctx, cancel = context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	if _, err := statusClient1.Metrics(ctx, &serverpb.MetricsRequest{NodeId: "local"}); err != nil {
 		t.Fatal(err)
@@ -254,12 +293,113 @@ func TestStopServer(t *testing.T) {
 	}
 
 	// Verify that request to Server 0 still works.
-	httpClient1, err = tc.Server(0).GetHTTPClient()
+	srv0 := tc.Server(0).SystemLayer()
+	httpClient1, err = srv0.GetUnauthenticatedHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
-	url = tc.Server(0).AdminURL() + "/_status/metrics/local"
+	url = srv0.AdminURL().WithPath("/_status/metrics/local").String()
 	if err := httputil.GetJSON(httpClient1, url, &response); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestRestart(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	stickyVFSRegistry := fs.NewStickyRegistry()
+	lisReg := listenerutil.NewListenerRegistry()
+	defer lisReg.Close()
+
+	const numServers int = 3
+	stickyServerArgs := make(map[int]base.TestServerArgs)
+	for i := 0; i < numServers; i++ {
+		stickyServerArgs[i] = base.TestServerArgs{
+			StoreSpecs: []base.StoreSpec{
+				{
+					InMemory:    true,
+					StickyVFSID: "TestRestart" + strconv.FormatInt(int64(i), 10),
+				},
+			},
+			Knobs: base.TestingKnobs{
+				Server: &server.TestingKnobs{
+					StickyVFSRegistry: stickyVFSRegistry,
+				},
+			},
+		}
+	}
+
+	ctx := context.Background()
+	tc := StartTestCluster(t, numServers,
+		base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{
+				DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+				DisableSQLServer:  true,
+			},
+			ReplicationMode:     base.ReplicationAuto,
+			ReusableListenerReg: lisReg,
+			ServerArgsPerNode:   stickyServerArgs,
+		})
+	defer tc.Stopper().Stop(ctx)
+	require.NoError(t, tc.WaitForFullReplication())
+
+	ids := make([]roachpb.ReplicationTarget, numServers)
+	for i := range tc.Servers {
+		ids[i] = tc.Target(i)
+	}
+
+	incArgs := &kvpb.IncrementRequest{
+		RequestHeader: kvpb.RequestHeader{
+			Key: roachpb.Key("b"),
+		},
+		Increment: 9,
+	}
+	if _, pErr := kv.SendWrapped(ctx, tc.GetFirstStoreFromServer(t, 0).DB().NonTransactionalSender(), incArgs); pErr != nil {
+		t.Fatal(pErr)
+	}
+	tc.WaitForValues(t, roachpb.Key("b"), []int64{9, 9, 9})
+
+	// First try to restart a single server.
+	tc.StopServer(1)
+	require.NoError(t, tc.RestartServer(1))
+	require.Equal(t, ids[1], tc.Target(1))
+	tc.WaitForValues(t, roachpb.Key("b"), []int64{9, 9, 9})
+
+	// Now restart the whole cluster.
+	require.NoError(t, tc.Restart())
+
+	// Validates that the NodeID and StoreID remain the same after a restart.
+	for i := range tc.Servers {
+		require.Equal(t, ids[i], tc.Target(i))
+	}
+
+	// Verify we can still read data.
+	tc.WaitForValues(t, roachpb.Key("b"), []int64{9, 9, 9})
+}
+
+func TestExpirationBasedLeases(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	tc := StartTestCluster(t, 1,
+		base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{
+				DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+				DisableSQLServer:  true,
+			},
+			ReplicationMode: base.ReplicationManual,
+		})
+	defer tc.Stopper().Stop(ctx)
+
+	key := tc.ScratchRangeWithExpirationLease(t)
+	repl := tc.GetFirstStoreFromServer(t, 0).LookupReplica(roachpb.RKey(key))
+	lease, _ := repl.GetLease()
+	require.NotNil(t, lease.Expiration)
+
+	// Verify idempotence of ScratchRangeWithExpirationLease
+	keyAgain := tc.ScratchRangeWithExpirationLease(t)
+	replAgain := tc.GetFirstStoreFromServer(t, 0).LookupReplica(roachpb.RKey(keyAgain))
+	require.Equal(t, repl, replAgain)
 }

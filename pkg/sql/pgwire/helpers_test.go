@@ -1,31 +1,19 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Alfonso Subiotto Marqués (alfonso@cockroachlabs.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pgwire
 
 import (
+	"context"
 	"time"
-
-	"golang.org/x/net/context"
 )
 
-func (s *Server) SetDrainingImpl(
-	drain bool, drainWait time.Duration, cancelWait time.Duration,
+func (s *Server) DrainImpl(
+	ctx context.Context, queryWait time.Duration, cancelWait time.Duration,
 ) error {
-	return s.setDrainingImpl(drain, drainWait, cancelWait)
+	return s.drainImpl(ctx, queryWait, cancelWait, nil, nil)
 }
 
 // OverwriteCancelMap overwrites all active connections' context.CancelFuncs so

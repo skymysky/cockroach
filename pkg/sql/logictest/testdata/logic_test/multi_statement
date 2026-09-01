@@ -1,4 +1,7 @@
-# LogicTest: default parallel-stmts distsql
+# LogicTest: !local-prepared
+# We turn off the local-prepared mode because this test depends on
+# multi-statement statements being run in single batches, which is not
+# doable with prepared statements.
 
 statement ok
 CREATE TABLE kv (
@@ -21,7 +24,7 @@ c d
 
 # error if either statement returns an error
 # first statement returns an error. Second stmt shouldn't execute.
-statement error duplicate key value \(k\)=\('a'\) violates unique constraint "primary"
+statement error duplicate key value violates unique constraint "kv_pkey"\nDETAIL: Key \(k\)=\('a'\) already exists\.
 INSERT INTO kv (k,v) VALUES ('a', 'b'); INSERT INTO kv (k,v) VALUES ('e', 'f')
 
 query TT rowsort
@@ -30,8 +33,8 @@ SELECT * FROM kv
 a b
 c d
 
-# second statement returns an error
-statement error duplicate key value \(k\)=\('a'\) violates unique constraint "primary"
+# second statement returns an error, and causes the whole batch to rollbacl
+statement error duplicate key value violates unique constraint "kv_pkey"\nDETAIL: Key \(k\)=\('a'\) already exists\.
 INSERT INTO kv (k,v) VALUES ('g', 'h'); INSERT INTO kv (k,v) VALUES ('a', 'b')
 
 query TT rowsort
@@ -39,10 +42,9 @@ SELECT * FROM kv
 ----
 a b
 c d
-g h
 
 # parse error runs nothing
-statement error syntax error at or near "k"
+statement error at or near "k": syntax error
 INSERT INTO kv (k,v) VALUES ('i', 'j'); INSERT INTO VALUES ('k', 'l')
 
 query TT rowsort
@@ -50,9 +52,8 @@ SELECT * FROM kv
 ----
 a b
 c d
-g h
 
-statement error pq: database "x" does not exist
+statement error pq: relation "x.y" does not exist
 BEGIN; INSERT INTO x.y(a) VALUES (1); END
 
 statement error pq: current transaction is aborted, commands ignored until end of transaction block
@@ -61,5 +62,5 @@ SELECT * from kv; ROLLBACK
 statement ok
 ROLLBACK
 
-statement error pq: table "system.t" does not exist
+statement error pgcode 42P01 relation "system.t" does not exist
 BEGIN TRANSACTION; SELECT * FROM system.t; INSERT INTO t(a) VALUES (1)

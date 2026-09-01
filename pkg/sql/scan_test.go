@@ -1,36 +1,24 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
 	"bytes"
+	"context"
 	gosql "database/sql"
 	"fmt"
 	"math/rand"
 	"sort"
 	"testing"
 
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // genAs returns num random distinct ordered values in [0, valRange).
@@ -52,7 +40,9 @@ func genValues(num, valRange int) []int {
 }
 
 // testScanBatchQuery runs a query of the form
-//  SELECT a,B FROM test.scan WHERE a IN (1,5,3..) AND b >= 5 AND b <= 10
+//
+//	SELECT a,B FROM test.scan WHERE a IN (1,5,3..) AND b >= 5 AND b <= 10
+//
 // numSpans controls the number of possible values for a.
 func testScanBatchQuery(t *testing.T, db *gosql.DB, numSpans, numAs, numBs int, reverse bool) {
 	// Generate numSpans values for A
@@ -130,89 +120,69 @@ func testScanBatchQuery(t *testing.T, db *gosql.DB, numSpans, numAs, numBs int, 
 // particular values and performing queries.
 func TestScanBatches(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	s, db, _ := serverutils.StartServer(
-		t, base.TestServerArgs{UseDatabase: "test"})
-	defer s.Stopper().Stop(context.TODO())
-
-	if _, err := db.Exec(`CREATE DATABASE IF NOT EXISTS test`); err != nil {
-		t.Fatal(err)
-	}
-
-	// The test will screw around with KVBatchSize; make sure to restore it at the end.
-	restore := sqlbase.SetKVBatchSize(10)
-	defer restore()
-
+	// The test sets up a table with a row for each pair of (a,b) values.
 	numAs := 5
 	numBs := 20
 
-	if _, err := db.Exec(`DROP TABLE IF EXISTS test.scan`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`CREATE TABLE test.scan (a INT, b INT, v STRING, PRIMARY KEY (a, b))`); err != nil {
-		t.Fatal(err)
-	}
-
-	var buf bytes.Buffer
-	buf.WriteString(`INSERT INTO test.scan VALUES `)
-	for a := 0; a < numAs; a++ {
-		for b := 0; b < numBs; b++ {
-			if a+b > 0 {
-				buf.WriteString(", ")
-			}
-			if (a+b)%2 == 0 {
-				fmt.Fprintf(&buf, "(%d, %d, 'str%d%d')", a, b, a, b)
-			} else {
-				// Every other row doesn't get the string value (to have NULLs).
-				fmt.Fprintf(&buf, "(%d, %d, NULL)", a, b)
-			}
-		}
-	}
-	if _, err := db.Exec(buf.String()); err != nil {
-		t.Fatal(err)
-	}
+	schema := `
+		CREATE DATABASE test;
+		CREATE TABLE test.scan (
+			a INT,
+			b INT,
+			v STRING,
+			PRIMARY KEY (a, b),
+			FAMILY (a),
+			FAMILY (b)
+		);`
 
 	// The table will have one key for the even rows, and two keys for the odd rows.
 	numKeys := 3 * numAs * numBs / 2
-	batchSizes := []int{1, 2, 3, 5, 10, 13, 100, numKeys - 1, numKeys, numKeys + 1}
-	numSpanValues := []int{0, 1, 2, 3}
+	batchByteSizes := []int{1, 2, 5, 13, 100, numKeys, numKeys * 5, numKeys * 100}
 
-	for _, batch := range batchSizes {
-		sqlbase.SetKVBatchSize(int64(batch))
-		for _, numSpans := range numSpanValues {
-			testScanBatchQuery(t, db, numSpans, numAs, numBs, false)
-			testScanBatchQuery(t, db, numSpans, numAs, numBs, true)
-		}
-	}
+	for _, batchBytesSize := range batchByteSizes {
+		// We must set up a separate server for each batch size, as we cannot change
+		// it while the server is running.
+		t.Run(fmt.Sprintf("%d", batchBytesSize), func(t *testing.T) {
+			s, db, _ := serverutils.StartServer(
+				t, base.TestServerArgs{
+					UseDatabase: "test",
+					Knobs: base.TestingKnobs{
+						DistSQL: &execinfra.TestingKnobs{
+							TableReaderBatchBytesLimit: int64(batchBytesSize),
+						},
+					},
+				})
+			defer s.Stopper().Stop(context.Background())
 
-	if _, err := db.Exec(`DROP TABLE test.scan`); err != nil {
-		t.Fatal(err)
-	}
-}
+			if _, err := db.Exec(schema); err != nil {
+				t.Fatal(err)
+			}
 
-func TestKVLimitHint(t *testing.T) {
-	defer leaktest.AfterTest(t)()
+			var buf bytes.Buffer
+			buf.WriteString(`INSERT INTO test.scan VALUES `)
+			for a := 0; a < numAs; a++ {
+				for b := 0; b < numBs; b++ {
+					if a+b > 0 {
+						buf.WriteString(", ")
+					}
+					if (a+b)%2 == 0 {
+						fmt.Fprintf(&buf, "(%d, %d, 'str%d%d')", a, b, a, b)
+					} else {
+						// Every other row doesn't get the string value (to have NULLs).
+						fmt.Fprintf(&buf, "(%d, %d, NULL)", a, b)
+					}
+				}
+			}
+			if _, err := db.Exec(buf.String()); err != nil {
+				t.Fatal(err)
+			}
 
-	testCases := []struct {
-		hardLimit int64
-		softLimit int64
-		filter    parser.TypedExpr
-		expected  int64
-	}{
-		{hardLimit: 0, softLimit: 0, filter: nil, expected: 0},
-		{hardLimit: 0, softLimit: 1, filter: nil, expected: 2},
-		{hardLimit: 0, softLimit: 23, filter: nil, expected: 46},
-		{hardLimit: 0, softLimit: 1, filter: parser.DBoolFalse, expected: 2},
-		{hardLimit: 1, softLimit: 0, filter: nil, expected: 1},
-		{hardLimit: 1, softLimit: 23, filter: nil, expected: 1},
-		{hardLimit: 5, softLimit: 23, filter: nil, expected: 5},
-		{hardLimit: 1, softLimit: 23, filter: parser.DBoolTrue, expected: 1},
-		{hardLimit: 1, softLimit: 23, filter: parser.DBoolFalse, expected: 2},
-	}
-	for _, tc := range testCases {
-		sn := scanNode{hardLimit: tc.hardLimit, softLimit: tc.softLimit, filter: tc.filter}
-		if limitHint := sn.limitHint(); limitHint != tc.expected {
-			t.Errorf("%+v: got %d", tc, limitHint)
-		}
+			for numSpans := 0; numSpans < 4; numSpans++ {
+				testScanBatchQuery(t, db, numSpans, numAs, numBs, false /* reverse */)
+				testScanBatchQuery(t, db, numSpans, numAs, numBs, true /* reverse */)
+			}
+		})
 	}
 }

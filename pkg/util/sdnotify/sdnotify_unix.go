@@ -1,27 +1,14 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
-//
-// Author: Ben Darnell
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-// +build !windows
+//go:build !windows
 
 package sdnotify
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"os/exec"
@@ -35,12 +22,16 @@ const (
 	netType  = "unixgram"
 )
 
-func ready() error {
-	return notifyEnv(readyMsg)
+func ready(preNotify func()) error {
+	return notifyEnv(preNotify, readyMsg)
 }
 
-func notifyEnv(msg string) error {
+func notifyEnv(preNotify func(), msg string) error {
 	if path, ok := os.LookupEnv(envName); ok {
+		// Only run preNotify if we need to notify.
+		if preNotify != nil {
+			preNotify()
+		}
 		return notify(path, msg)
 	}
 	return nil
@@ -61,8 +52,8 @@ func notify(path, msg string) error {
 	return err
 }
 
-func bgExec(cmd *exec.Cmd) error {
-	l, err := listen()
+func bgExec(cmd *exec.Cmd, socketDir string) error {
+	l, err := listen(socketDir)
 	if err != nil {
 		return err
 	}
@@ -103,8 +94,8 @@ type listener struct {
 	conn    *net.UnixConn
 }
 
-func listen() (listener, error) {
-	dir, err := ioutil.TempDir("", "sdnotify")
+func listen(socketDir string) (listener, error) {
+	dir, err := os.MkdirTemp(socketDir, "sdnotify")
 	if err != nil {
 		return listener{}, err
 	}

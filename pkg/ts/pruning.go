@@ -1,29 +1,18 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ts
 
 import (
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
@@ -31,41 +20,6 @@ var (
 	firstTSRKey = roachpb.RKey(keys.TimeseriesPrefix)
 	lastTSRKey  = firstTSRKey.PrefixEnd()
 )
-
-// ContainsTimeSeries returns true if the given key range overlaps the
-// range of possible time series keys.
-func (tsdb *DB) ContainsTimeSeries(start, end roachpb.RKey) bool {
-	return !lastTSRKey.Less(start) && !end.Less(firstTSRKey)
-}
-
-// PruneTimeSeries prunes old data for any time series found in the supplied
-// key range.
-//
-// The snapshot should be supplied by a local store, and is used only to
-// discover the names of time series which are store in that snapshot. The KV
-// client is then used to prune old data from the discovered series.
-//
-// The snapshot is used for key discovery (as opposed to the KV client) because
-// the task of pruning time series is distributed across the cluster to the
-// individual ranges which contain that time series data. Because replicas of
-// those ranges are guaranteed to have time series data locally, we can use the
-// snapshot to quickly obtain a set of keys to be pruned with no network calls.
-func (tsdb *DB) PruneTimeSeries(
-	ctx context.Context,
-	snapshot engine.Reader,
-	start, end roachpb.RKey,
-	db *client.DB,
-	timestamp hlc.Timestamp,
-) error {
-	series, err := findTimeSeries(snapshot, start, end, timestamp)
-	if err != nil {
-		return err
-	}
-	return pruneTimeSeries(ctx, db, series, timestamp)
-}
-
-// Assert that DB implements the necessary interface from the storage package.
-var _ storage.TimeSeriesDataStore = (*DB)(nil)
 
 type timeSeriesResolutionInfo struct {
 	Name       string
@@ -78,42 +32,47 @@ type timeSeriesResolutionInfo struct {
 // pair will only be identified once, even if the range contains keys for that
 // name/resolution pair at multiple timestamps or from multiple sources.
 //
-// An engine snapshot is used, rather than a client, because this function is
+// A local engine is used, rather than a client, because this function is
 // intended to be called by a storage queue which can inspect the local data for
 // a single range without the need for expensive network calls.
-func findTimeSeries(
-	snapshot engine.Reader, startKey, endKey roachpb.RKey, now hlc.Timestamp,
+func (tsdb *DB) findTimeSeries(
+	ctx context.Context, reader storage.Reader, startKey, endKey roachpb.RKey, now hlc.Timestamp,
 ) ([]timeSeriesResolutionInfo, error) {
 	var results []timeSeriesResolutionInfo
 
-	iter := snapshot.NewIterator(false)
-	defer iter.Close()
-
 	// Set start boundary for the search, which is the lesser of the range start
 	// key and the beginning of time series data.
-	start := engine.MakeMVCCMetadataKey(startKey.AsRawKey())
-	next := engine.MakeMVCCMetadataKey(keys.TimeseriesPrefix)
+	start := storage.MakeMVCCMetadataKey(startKey.AsRawKey())
+	next := storage.MakeMVCCMetadataKey(keys.TimeseriesPrefix)
 	if next.Less(start) {
 		next = start
 	}
 
 	// Set end boundary for the search, which is the lesser of the range end key
 	// and the end of time series data.
-	end := engine.MakeMVCCMetadataKey(endKey.AsRawKey())
-	lastTS := engine.MakeMVCCMetadataKey(keys.TimeseriesPrefix.PrefixEnd())
+	end := storage.MakeMVCCMetadataKey(endKey.AsRawKey())
+	lastTS := storage.MakeMVCCMetadataKey(keys.TimeseriesPrefix.PrefixEnd())
 	if lastTS.Less(end) {
 		end = lastTS
 	}
 
-	thresholds := computeThresholds(now.WallTime)
+	thresholds := tsdb.computeThresholds(now.WallTime)
 
-	for iter.Seek(next); ; iter.Seek(next) {
+	// NB: timeseries don't have intents.
+	iter, err := reader.NewMVCCIterator(
+		ctx, storage.MVCCKeyIterKind, storage.IterOptions{UpperBound: endKey.AsRawKey()})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	for iter.SeekGE(next); ; iter.SeekGE(next) {
 		if ok, err := iter.Valid(); err != nil {
 			return nil, err
-		} else if !ok || !iter.Less(end) {
+		} else if !ok || !iter.UnsafeKey().Less(end) {
 			break
 		}
-		foundKey := iter.Key().Key
+		foundKey := iter.UnsafeKey().Key.Clone()
 
 		// Extract the name and resolution from the discovered key.
 		name, _, res, tsNanos, err := DecodeDataKey(foundKey)
@@ -132,7 +91,7 @@ func findTimeSeries(
 
 		// Set 'next' is initialized to the next possible time series key
 		// which could belong to a previously undiscovered time series.
-		next = engine.MakeMVCCMetadataKey(makeDataKeySeriesPrefix(name, res).PrefixEnd())
+		next = storage.MakeMVCCMetadataKey(makeDataKeySeriesPrefix(name, res).PrefixEnd())
 	}
 
 	return results, nil
@@ -152,16 +111,15 @@ func findTimeSeries(
 //
 // As range deletion of inline data is an idempotent operation, it is safe to
 // run this operation concurrently on multiple nodes at the same time.
-func pruneTimeSeries(
-	ctx context.Context, db *client.DB, timeSeriesList []timeSeriesResolutionInfo, now hlc.Timestamp,
+func (tsdb *DB) pruneTimeSeries(
+	ctx context.Context, db *kv.DB, timeSeriesList []timeSeriesResolutionInfo, now hlc.Timestamp,
 ) error {
-	thresholds := computeThresholds(now.WallTime)
+	thresholds := tsdb.computeThresholds(now.WallTime)
 
-	b := &client.Batch{}
+	b := &kv.Batch{}
 	for _, timeSeries := range timeSeriesList {
 		// Time series data for a specific resolution falls in a contiguous key
 		// range, and can be deleted with a DelRange command.
-
 		// The start key is the prefix unique to this name/resolution pair.
 		start := makeDataKeySeriesPrefix(timeSeries.Name, timeSeries.Resolution)
 
@@ -177,8 +135,8 @@ func pruneTimeSeries(
 			end = start.PrefixEnd()
 		}
 
-		b.AddRawRequest(&roachpb.DeleteRangeRequest{
-			Span: roachpb.Span{
+		b.AddRawRequest(&kvpb.DeleteRangeRequest{
+			RequestHeader: kvpb.RequestHeader{
 				Key:    start,
 				EndKey: end,
 			},
@@ -187,15 +145,4 @@ func pruneTimeSeries(
 	}
 
 	return db.Run(ctx, b)
-}
-
-// computeThresholds returns a map of timestamps for each resolution supported
-// by the system. Data at a resolution which is older than the threshold
-// timestamp for that resolution is considered eligible for deletion.
-func computeThresholds(timestamp int64) map[Resolution]int64 {
-	result := make(map[Resolution]int64, len(pruneThresholdByResolution))
-	for k, v := range pruneThresholdByResolution {
-		result[k] = timestamp - v
-	}
-	return result
 }

@@ -1,281 +1,473 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
+	"context"
 	"fmt"
+	"strings"
 
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
-
-	"github.com/cockroachdb/cockroach/pkg/config"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/decodeusername"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
+	"github.com/cockroachdb/cockroach/pkg/sql/regions"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemaobjectlimit"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlclustersettings"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/errors"
 )
 
-var (
-	errEmptyDatabaseName = errors.New("empty database name")
-	errNoDatabase        = errors.New("no database specified")
-	errNoTable           = errors.New("no table specified")
-)
+// This file contains routines for low-level access to stored
+// descriptors.
+//
+// For higher levels in the SQL layer, these interface are likely not
+// suitable; consider instead schema_accessors.go and resolver.go.
+//
 
-// DescriptorAccessor provides helper methods for using descriptors
-// to SQL objects.
-type DescriptorAccessor interface {
-	// createDescriptor takes a Table or Database descriptor and creates it if
-	// needed, incrementing the descriptor counter. Returns true if the descriptor
-	// is actually created, false if it already existed, or an error if one was encountered.
-	// The ifNotExists flag is used to declare if the "already existed" state should be an
-	// error (false) or a no-op (true).
-	createDescriptor(
-		ctx context.Context,
-		plainKey sqlbase.DescriptorKey,
-		descriptor sqlbase.DescriptorProto,
-		ifNotExists bool,
-	) (bool, error)
-}
+// createDatabase takes Database descriptor and creates it if needed,
+// incrementing the descriptor counter. Returns true if the descriptor
+// is actually created, false if it already existed, or an error if one was
+// encountered. The ifNotExists flag is used to declare if the "already existed"
+// state should be an error (false) or a no-op (true).
+// createDatabase implements the DatabaseDescEditor interface.
+func (p *planner) createDatabase(
+	ctx context.Context, database *tree.CreateDatabase, jobDesc string,
+) (*dbdesc.Mutable, bool, error) {
 
-var _ DescriptorAccessor = &planner{}
+	dbName := string(database.Name)
 
-type descriptorAlreadyExistsErr struct {
-	desc sqlbase.DescriptorProto
-	name string
-}
-
-func (d descriptorAlreadyExistsErr) Error() string {
-	return fmt.Sprintf("%s %q already exists", d.desc.TypeName(), d.name)
-}
-
-// GenerateUniqueDescID returns the next available Descriptor ID and increments
-// the counter. The incrementing is non-transactional, and the counter could be
-// incremented multiple times because of retries.
-func GenerateUniqueDescID(ctx context.Context, db *client.DB) (sqlbase.ID, error) {
-	// Increment unique descriptor counter.
-	newVal, err := client.IncrementValRetryable(ctx, db, keys.DescIDGenerator, 1)
-	if err != nil {
-		return 0, err
-	}
-	return sqlbase.ID(newVal - 1), nil
-}
-
-// createDescriptor implements the DescriptorAccessor interface.
-func (p *planner) createDescriptor(
-	ctx context.Context,
-	plainKey sqlbase.DescriptorKey,
-	descriptor sqlbase.DescriptorProto,
-	ifNotExists bool,
-) (bool, error) {
-	idKey := plainKey.Key()
-
-	if exists, err := descExists(ctx, p.txn, idKey); err == nil && exists {
-		if ifNotExists {
+	if dbID, err := p.Descriptors().LookupDatabaseID(ctx, p.txn, dbName); err == nil && dbID != descpb.InvalidID {
+		if database.IfNotExists {
+			// Check if the database is in a dropping state
+			desc, err := p.Descriptors().ByIDWithoutLeased(p.txn).Get().Database(ctx, dbID)
+			if err != nil {
+				return nil, false, err
+			}
+			if desc.Dropped() {
+				return nil, false, pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
+					"database %q is being dropped, try again later",
+					dbName)
+			}
 			// Noop.
-			return false, nil
+			return nil, false, nil
 		}
-		// Key exists, but we don't want it to: error out.
-		switch descriptor.TypeName() {
-		case "database":
-			return false, sqlbase.NewDatabaseAlreadyExistsError(plainKey.Name())
-		case "table", "view":
-			return false, sqlbase.NewRelationAlreadyExistsError(plainKey.Name())
-		default:
-			return false, descriptorAlreadyExistsErr{descriptor, plainKey.Name()}
-		}
+		return nil, false, sqlerrors.NewDatabaseAlreadyExistsError(dbName)
 	} else if err != nil {
-		return false, err
+		return nil, false, err
 	}
 
-	id, err := GenerateUniqueDescID(ctx, p.session.execCfg.DB)
+	id, err := p.extendedEvalCtx.DescIDGenerator.GenerateUniqueDescID(ctx)
 	if err != nil {
-		return false, err
+		return nil, false, err
+	}
+	publicSchemaID, err := p.EvalContext().DescIDGenerator.GenerateUniqueDescID(ctx)
+	if err != nil {
+		return nil, false, err
 	}
 
-	return true, p.createDescriptorWithID(ctx, idKey, id, descriptor)
+	if database.PrimaryRegion != tree.PrimaryRegionNotSpecifiedName {
+		telemetry.Inc(sqltelemetry.CreateMultiRegionDatabaseCounter)
+		telemetry.Inc(
+			sqltelemetry.CreateDatabaseSurvivalGoalCounter(
+				database.SurvivalGoal.TelemetryName(),
+			),
+		)
+		if database.Placement != tree.DataPlacementUnspecified {
+			telemetry.Inc(
+				sqltelemetry.CreateDatabasePlacementCounter(
+					database.Placement.TelemetryName(),
+				),
+			)
+		}
+	}
+
+	regionConfig, err := p.maybeInitializeMultiRegionMetadata(
+		ctx,
+		database.SurvivalGoal,
+		database.PrimaryRegion,
+		database.Regions,
+		database.Placement,
+		database.SecondaryRegion,
+	)
+	if err != nil {
+		return nil, false, err
+	}
+
+	owner := p.SessionData().User()
+	if !database.Owner.Undefined() {
+		owner, err = decodeusername.FromRoleSpec(
+			p.SessionData(), username.PurposeValidation, database.Owner,
+		)
+		if err != nil {
+			return nil, true, err
+		}
+		if err := p.checkAdminOrMemberOfRole(ctx, owner); err != nil {
+			return nil, true, err
+		}
+	}
+
+	db := dbdesc.NewInitial(
+		id,
+		string(database.Name),
+		owner,
+		dbdesc.MaybeWithDatabaseRegionConfig(regionConfig),
+		dbdesc.WithPublicSchemaID(publicSchemaID),
+	)
+	includeCreatePriv := sqlclustersettings.PublicSchemaCreatePrivilegeEnabled.Get(&p.execCfg.Settings.SV)
+	publicSchema := schemadesc.NewBuilder(&descpb.SchemaDescriptor{
+		ParentID:   id,
+		Name:       catconstants.PublicSchemaName,
+		ID:         publicSchemaID,
+		Privileges: catpb.NewPublicSchemaPrivilegeDescriptor(owner, includeCreatePriv),
+		Version:    1,
+	}).BuildCreatedMutableSchema()
+
+	if err := p.createDescriptor(ctx, db, jobDesc); err != nil {
+		return nil, true, err
+	}
+	if err := p.createDescriptor(
+		ctx,
+		publicSchema,
+		tree.AsStringWithFQNames(database, p.Ann()),
+	); err != nil {
+		return nil, true, err
+	}
+
+	// Initialize the multi-region database by creating the multi-region enum and
+	// database-level zone configuration if there is a region config on the
+	// descriptor.
+
+	if err := p.maybeInitializeMultiRegionDatabase(ctx, db, regionConfig); err != nil {
+		return nil, true, err
+	}
+
+	if database.SuperRegion.Name != "" {
+		if !db.IsMultiRegion() {
+			return nil, false, pgerror.New(pgcode.InvalidDatabaseDefinition,
+				"cannot add super region to a non-multi-region database")
+		}
+		typeID, err := db.MultiRegionEnumID()
+		if err != nil {
+			return nil, false, err
+		}
+		typeDesc, err := p.Descriptors().MutableByID(p.txn).Type(ctx, typeID)
+		if err != nil {
+			return nil, false, err
+		}
+
+		if err = p.addSuperRegion(
+			ctx,
+			db,
+			typeDesc,
+			database.SuperRegion.Regions,
+			database.SuperRegion.Name,
+			tree.AsStringWithFQNames(database, p.Ann()),
+			nil,
+		); err != nil {
+			return nil, false, err
+		}
+
+	}
+
+	return db, true, nil
 }
 
-func descExists(ctx context.Context, txn *client.Txn, idKey roachpb.Key) (bool, error) {
-	// Check whether idKey exists.
-	gr, err := txn.Get(ctx, idKey)
-	if err != nil {
-		return false, err
-	}
-	return gr.Exists(), nil
-}
-
-func (p *planner) createDescriptorWithID(
-	ctx context.Context, idKey roachpb.Key, id sqlbase.ID, descriptor sqlbase.DescriptorProto,
+func (p *planner) createDescriptor(
+	ctx context.Context, descriptor catalog.MutableDescriptor, jobDesc string,
 ) error {
-	descriptor.SetID(id)
-	// TODO(pmattis): The error currently returned below is likely going to be
-	// difficult to interpret.
-	//
-	// TODO(pmattis): Need to handle if-not-exists here as well.
-	//
-	// TODO(pmattis): This is writing the namespace and descriptor table entries,
-	// but not going through the normal INSERT logic and not performing a precise
-	// mimicry. In particular, we're only writing a single key per table, while
-	// perfect mimicry would involve writing a sentinel key for each row as well.
-	descKey := sqlbase.MakeDescMetadataKey(descriptor.GetID())
-
-	b := &client.Batch{}
-	descID := descriptor.GetID()
-	descDesc := sqlbase.WrapDescriptor(descriptor)
-	if p.session.Tracing.KVTracingEnabled() {
-		log.VEventf(ctx, 2, "CPut %s -> %d", idKey, descID)
-		log.VEventf(ctx, 2, "CPut %s -> %s", descKey, descDesc)
+	if err := p.shouldRestrictAccessToSystemInterface(ctx,
+		"DDL execution",   /* operation */
+		"running the DDL", /* alternate action */
+	); err != nil {
+		return err
 	}
-	b.CPut(idKey, descID, nil)
-	b.CPut(descKey, descDesc, nil)
 
-	p.session.setTestingVerifyMetadata(func(systemConfig config.SystemConfig) error {
-		if err := expectDescriptorID(systemConfig, idKey, descID); err != nil {
+	if !descriptor.IsNew() {
+		return errors.AssertionFailedf(
+			"expected new descriptor, not a modification of version %d",
+			descriptor.OriginalVersion())
+	}
+
+	if err := schemaobjectlimit.CheckMaxSchemaObjects(
+		ctx, p.InternalSQLTxn(), p.Descriptors(), p.execCfg.TableStatsCache, p.execCfg.Settings, 1,
+	); err != nil {
+		return err
+	}
+
+	b := p.Txn().NewBatch()
+	kvTrace := p.ExtendedEvalContext().Tracing.KVTracingEnabled()
+	if err := p.Descriptors().WriteDescToBatch(ctx, kvTrace, descriptor, b); err != nil {
+		return err
+	}
+	if !descriptor.SkipNamespace() {
+		if err := p.Descriptors().InsertNamespaceEntryToBatch(ctx, kvTrace, descriptor, b); err != nil {
 			return err
 		}
-		return expectDescriptor(systemConfig, descKey, descDesc)
-	})
-
-	return p.txn.Run(ctx, b)
+	}
+	if err := p.txn.Run(ctx, b); err != nil {
+		return err
+	}
+	if tbl, ok := descriptor.(*tabledesc.Mutable); ok && tbl.Adding() {
+		// Queue a schema change job to eventually make the table public.
+		if err := p.createOrUpdateSchemaChangeJob(
+			ctx, tbl, jobDesc, descpb.InvalidMutationID,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// getDescriptor looks up the descriptor for `plainKey`, validates it,
-// and unmarshals it into `descriptor`.
-//
-// If `plainKey` doesn't exist, returns false and nil error.
-// In most cases you'll want to use wrappers: `getDatabaseDesc` or
-// `getTableDesc`.
-func getDescriptor(
+// TranslateSurvivalGoal translates a tree.SurvivalGoal into a
+// descpb.SurvivalGoal.
+func TranslateSurvivalGoal(g tree.SurvivalGoal) (descpb.SurvivalGoal, error) {
+	switch g {
+	case tree.SurvivalGoalDefault:
+		return descpb.SurvivalGoal_ZONE_FAILURE, nil
+	case tree.SurvivalGoalZoneFailure:
+		return descpb.SurvivalGoal_ZONE_FAILURE, nil
+	case tree.SurvivalGoalRegionFailure:
+		return descpb.SurvivalGoal_REGION_FAILURE, nil
+	default:
+		return 0, errors.Newf("unknown survival goal: %d", g)
+	}
+}
+
+// TranslateDataPlacement translates a tree.DataPlacement into a
+// descpb.DataPlacement.
+func TranslateDataPlacement(g tree.DataPlacement) (descpb.DataPlacement, error) {
+	switch g {
+	case tree.DataPlacementUnspecified:
+		return descpb.DataPlacement_DEFAULT, nil
+	case tree.DataPlacementDefault:
+		return descpb.DataPlacement_DEFAULT, nil
+	case tree.DataPlacementRestricted:
+		return descpb.DataPlacement_RESTRICTED, nil
+	default:
+		return 0, errors.AssertionFailedf("unknown data placement: %d", g)
+	}
+}
+
+// checkRegionIsCurrentlyActive looks up the set of active regions and
+// checks whether the region argument is in that set. If this is a secondary
+// tenant, and this check is for the system database, we augment the behavior
+// to only look up the host regions.
+func (p *planner) checkRegionIsCurrentlyActive(
+	ctx context.Context, region catpb.RegionName, isSystemDatabase bool,
+) error {
+	var liveRegions LiveClusterRegions
+	if !p.execCfg.Codec.ForSystemTenant() && isSystemDatabase {
+		provider := p.regionsProvider()
+		if provider == nil {
+			return errors.AssertionFailedf("no regions provider available")
+		}
+		systemRegions, err := provider.GetSystemRegions(ctx)
+		if err != nil {
+			return err
+		}
+		liveRegions = regionsResponseToLiveClusterRegions(systemRegions)
+	} else {
+		var err error
+		if liveRegions, err = p.getLiveClusterRegions(ctx); err != nil {
+			return err
+		}
+	}
+
+	// Ensure that the region we're adding is currently active.
+	return CheckClusterRegionIsLive(liveRegions, region)
+}
+
+// InitializeMultiRegionMetadataCCL is the public hook point for the
+// CCL-licensed multi-region initialization code.
+var InitializeMultiRegionMetadataCCL = func(
 	ctx context.Context,
-	txn *client.Txn,
-	plainKey sqlbase.DescriptorKey,
-	descriptor sqlbase.DescriptorProto,
-) (bool, error) {
-	gr, err := txn.Get(ctx, plainKey.Key())
-	if err != nil {
-		return false, err
-	}
-	if !gr.Exists() {
-		return false, nil
-	}
-
-	descKey := sqlbase.MakeDescMetadataKey(sqlbase.ID(gr.ValueInt()))
-	desc := &sqlbase.Descriptor{}
-	if err := txn.GetProto(ctx, descKey, desc); err != nil {
-		return false, err
-	}
-
-	switch t := descriptor.(type) {
-	case *sqlbase.TableDescriptor:
-		table := desc.GetTable()
-		if table == nil {
-			return false, errors.Errorf("%q is not a table", plainKey.Name())
-		}
-		table.MaybeUpgradeFormatVersion()
-		// TODO(dan): Write the upgraded TableDescriptor back to kv. This will break
-		// the ability to use a previous version of cockroach with the on-disk data,
-		// but it's worth it to avoid having to do the upgrade every time the
-		// descriptor is fetched. Our current test for this enforces compatibility
-		// backward and forward, so that'll have to be extended before this is done.
-		if err := table.Validate(ctx, txn); err != nil {
-			return false, err
-		}
-		*t = *table
-	case *sqlbase.DatabaseDescriptor:
-		database := desc.GetDatabase()
-		if database == nil {
-			return false, errors.Errorf("%q is not a database", plainKey.Name())
-		}
-		if err := database.Validate(); err != nil {
-			return false, err
-		}
-		*t = *database
-	}
-	return true, nil
+	descIDGenerator eval.DescIDGenerator,
+	settings *cluster.Settings,
+	liveClusterRegions LiveClusterRegions,
+	survivalGoal tree.SurvivalGoal,
+	primaryRegion catpb.RegionName,
+	regions []tree.Name,
+	dataPlacement tree.DataPlacement,
+	secondaryRegion catpb.RegionName,
+) (*multiregion.RegionConfig, error) {
+	return nil, sqlerrors.NewCCLRequiredError(
+		errors.New("creating multi-region databases requires a CCL binary"),
+	)
 }
 
-// getAllDescriptors looks up and returns all available descriptors.
-func getAllDescriptors(ctx context.Context, txn *client.Txn) ([]sqlbase.DescriptorProto, error) {
-	descsKey := sqlbase.MakeAllDescsMetadataKey()
-	kvs, err := txn.Scan(ctx, descsKey, descsKey.PrefixEnd(), 0)
+// SecondaryTenantsMultiRegionAbstractionsEnabledSettingName is the name of the
+// cluster setting that governs secondary tenant multi-region abstraction usage.
+const SecondaryTenantsMultiRegionAbstractionsEnabledSettingName = "sql.virtual_cluster.feature_access.multiregion.enabled"
+
+// SecondaryTenantsMultiRegionAbstractionsEnabled controls if secondary tenants
+// are allowed to use multi-region abstractions. In particular, it controls if
+// secondary tenants are allowed to add a region to their database. It has no
+// effect on the system tenant.
+//
+// This setting has no effect for existing multi-region databases that have
+// already been configured. It only affects regions being added to new
+// databases.
+var SecondaryTenantsMultiRegionAbstractionsEnabled = settings.RegisterBoolSetting(
+	settings.SystemVisible,
+	"sql.multi_region.allow_abstractions_for_secondary_tenants.enabled", // internal key, name defined above
+	"allow the use of multi-region abstractions and syntax in virtual clusters",
+	true,
+	settings.WithName(SecondaryTenantsMultiRegionAbstractionsEnabledSettingName),
+)
+
+// maybeInitializeMultiRegionMetadata initializes multi-region metadata if a
+// primary region is supplied and works as a pass-through otherwise. It creates
+// a new region config from the given parameters and reserves an ID for the
+// multi-region enum.
+func (p *planner) maybeInitializeMultiRegionMetadata(
+	ctx context.Context,
+	survivalGoal tree.SurvivalGoal,
+	primaryRegion tree.Name,
+	regions []tree.Name,
+	placement tree.DataPlacement,
+	secondaryRegion tree.Name,
+) (*multiregion.RegionConfig, error) {
+	if !p.execCfg.Codec.ForSystemTenant() &&
+		!SecondaryTenantsMultiRegionAbstractionsEnabled.Get(&p.execCfg.Settings.SV) {
+		// There was no primary region provided, let the thing pass through.
+		if primaryRegion == "" && len(regions) == 0 {
+			return nil, nil
+		}
+
+		return nil, errors.WithHint(pgerror.Newf(
+			pgcode.InvalidDatabaseDefinition,
+			"setting %s disallows use of multi-region abstractions",
+			SecondaryTenantsMultiRegionAbstractionsEnabledSettingName,
+		),
+			"consider omitting the primary region")
+	}
+
+	if primaryRegion == "" && len(regions) == 0 {
+		var err error
+		primaryRegion, regions, err = p.getDefaultDatabaseRegions(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if primaryRegion == "" {
+			return nil, nil
+		}
+		p.BufferClientNotice(ctx, formatDefaultRegionNotice(primaryRegion, regions))
+	}
+
+	liveRegions, err := p.getLiveClusterRegions(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	descs := make([]sqlbase.DescriptorProto, len(kvs))
-	for i, kv := range kvs {
-		desc := &sqlbase.Descriptor{}
-		if err := kv.ValueProto(desc); err != nil {
-			return nil, err
-		}
-		switch t := desc.Union.(type) {
-		case *sqlbase.Descriptor_Table:
-			descs[i] = desc.GetTable()
-		case *sqlbase.Descriptor_Database:
-			descs[i] = desc.GetDatabase()
-		default:
-			return nil, errors.Errorf("Descriptor.Union has unexpected type %T", t)
-		}
+	regionConfig, err := InitializeMultiRegionMetadataCCL(
+		ctx,
+		p.EvalContext().DescIDGenerator,
+		p.EvalContext().Settings,
+		liveRegions,
+		survivalGoal,
+		catpb.RegionName(primaryRegion),
+		regions,
+		placement,
+		catpb.RegionName(secondaryRegion),
+	)
+	if err != nil {
+		return nil, err
 	}
-	return descs, nil
+
+	return regionConfig, nil
 }
 
-// getDescriptorsFromTargetList fetches the descriptors for the targets.
-func getDescriptorsFromTargetList(
-	ctx context.Context, txn *client.Txn, vt VirtualTabler, db string, targets parser.TargetList,
-) ([]sqlbase.DescriptorProto, error) {
-	if targets.Databases != nil {
-		if len(targets.Databases) == 0 {
-			return nil, errNoDatabase
-		}
-		descs := make([]sqlbase.DescriptorProto, 0, len(targets.Databases))
-		for _, database := range targets.Databases {
-			descriptor, err := MustGetDatabaseDesc(ctx, txn, vt, string(database))
-			if err != nil {
-				return nil, err
+// formatDefaultRegionNotice formats an error that looks like:
+//
+// defaulting to 'WITH PRIMARY REGION "us-east1" REGIONS "us-west2",
+// "us-central3"' as no primary region was specified
+//
+// The error message is intended to echo sql that is equivalent to the default
+// behavior.
+func formatDefaultRegionNotice(primary tree.Name, regions []tree.Name) pgnotice.Notice {
+	var message strings.Builder
+	fmt.Fprintf(&message, `defaulting to 'WITH PRIMARY REGION "%s"`, primary)
+
+	// Add non-primary regions to the message if present.
+	if 0 < len(regions) {
+		fmt.Fprintf(&message, ` REGIONS`)
+		for i := range regions {
+			fmt.Fprintf(&message, ` "%s"`, regions[i])
+			if i < len(regions)-1 {
+				fmt.Fprint(&message, `,`)
 			}
-			descs = append(descs, descriptor)
 		}
-		return descs, nil
 	}
 
-	if len(targets.Tables) == 0 {
-		return nil, errNoTable
+	fmt.Fprint(&message, `' as no primary region was specified`)
+	return pgnotice.Newf("%s", message.String())
+}
+
+// getDefaultDatabaseRegions returns the default primary and nonPrimary regions
+// for a database if the user did not specify a primary region via sql.
+func (p *planner) getDefaultDatabaseRegions(
+	ctx context.Context,
+) (primary tree.Name, nonPrimary []tree.Name, err error) {
+	// If 'sql.defaults.primary_region' is set, use the setting value.
+	defaultPrimaryRegion := sqlclustersettings.DefaultPrimaryRegion.Get(&p.execCfg.Settings.SV)
+	if defaultPrimaryRegion != "" {
+		return tree.Name(defaultPrimaryRegion), nil, nil
 	}
-	descs := make([]sqlbase.DescriptorProto, 0, len(targets.Tables))
-	for _, tableTarget := range targets.Tables {
-		tableGlob, err := tableTarget.NormalizeTablePattern()
-		if err != nil {
-			return nil, err
-		}
-		tables, err := expandTableGlob(ctx, txn, vt, db, tableGlob)
-		if err != nil {
-			return nil, err
-		}
-		for i := range tables {
-			descriptor, err := mustGetTableOrViewDesc(
-				ctx, txn, vt, &tables[i], true /*allowAdding*/)
-			if err != nil {
-				return nil, err
-			}
-			descs = append(descs, descriptor)
+
+	// Otherwise, retrieve the primary region from the system database's
+	// descriptor and the set of all regions from the system database's region
+	// enum.
+	systemDatabase, err := p.Descriptors().ByIDWithLeased(p.txn).Get().Database(ctx, keys.SystemDatabaseID)
+	if err != nil {
+		return "", nil, errors.NewAssertionErrorWithWrappedErrf(
+			err, "failed to resolve system database for regions",
+		)
+	}
+
+	enumRegions, err := regions.GetDatabaseRegions(ctx, p.txn, systemDatabase, p.Descriptors())
+	if err != nil {
+		return "", nil, err
+	}
+	if len(enumRegions) == 0 {
+		return "", nil, nil
+	}
+
+	primaryRegion := tree.Name(systemDatabase.GetRegionConfig().PrimaryRegion)
+	for region := range enumRegions {
+		nextRegion := tree.Name(region)
+		if nextRegion != primaryRegion {
+			nonPrimary = append(nonPrimary, nextRegion)
 		}
 	}
-	return descs, nil
+
+	return primaryRegion, nonPrimary, nil
+}
+
+// GetImmutableTableInterfaceByID is part of the EvalPlanner interface.
+func (p *planner) GetImmutableTableInterfaceByID(ctx context.Context, id int) (interface{}, error) {
+	desc, err := p.Descriptors().ByIDWithLeased(p.txn).WithoutNonPublic().Get().Table(ctx, descpb.ID(id))
+	if err != nil {
+		return nil, err
+	}
+	return desc, nil
 }

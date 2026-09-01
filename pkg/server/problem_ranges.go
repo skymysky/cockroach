@@ -1,56 +1,45 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
 import (
-	"sort"
+	"context"
 
-	"golang.org/x/net/context"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-
-	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
-func (s *statusServer) ProblemRanges(
+func (s *systemStatusServer) ProblemRanges(
 	ctx context.Context, req *serverpb.ProblemRangesRequest,
 ) (*serverpb.ProblemRangesResponse, error) {
 	ctx = s.AnnotateCtx(ctx)
 
-	response := &serverpb.ProblemRangesResponse{}
-	if len(req.NodeID) > 0 {
-		var err error
-		response.NodeID, _, err = s.parseNodeID(req.NodeID)
-		if err != nil {
-			return nil, grpc.Errorf(codes.InvalidArgument, err.Error())
-		}
+	if err := s.privilegeChecker.RequireViewClusterMetadataPermission(ctx); err != nil {
+		return nil, err
 	}
 
-	isLiveMap := s.nodeLiveness.GetIsLiveMap()
-	if response.NodeID != 0 {
-		// If there is a specific nodeID requested, limited the responses to
-		// just this node.
-		if !isLiveMap[response.NodeID] {
-			return nil, grpc.Errorf(codes.NotFound, "n%d is not alive", response.NodeID)
+	response := &serverpb.ProblemRangesResponse{
+		NodeID:           roachpb.NodeID(s.serverIterator.getID()),
+		ProblemsByNodeID: make(map[roachpb.NodeID]serverpb.ProblemRangesResponse_NodeProblems),
+	}
+
+	var isLiveMap map[roachpb.NodeID]livenesspb.NodeVitality
+	// If there is a specific nodeID requested, limited the responses to
+	// just that node.
+	if len(req.NodeID) > 0 {
+		requestedNodeID, _, err := s.parseNodeID(req.NodeID)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
 		}
-		isLiveMap = map[roachpb.NodeID]bool{
-			response.NodeID: true,
-		}
+		isLiveMap = map[roachpb.NodeID]livenesspb.NodeVitality{requestedNodeID: s.nodeLiveness.GetNodeVitalityFromCache(requestedNodeID)}
+	} else {
+		isLiveMap = s.nodeLiveness.ScanNodeVitalityFromCache()
 	}
 
 	type nodeResponse struct {
@@ -58,28 +47,20 @@ func (s *statusServer) ProblemRanges(
 		resp   *serverpb.RangesResponse
 		err    error
 	}
-	noRaftLeader := make(map[roachpb.RangeID]struct{})
-	numNodes := len(isLiveMap)
+
 	responses := make(chan nodeResponse)
-	nodeCtx, cancel := context.WithTimeout(ctx, base.NetworkTimeout)
-	defer cancel()
-	for nodeID, alive := range isLiveMap {
-		if !alive {
-			response.Failures = append(response.Failures, serverpb.Failure{
-				NodeID:       nodeID,
-				ErrorMessage: "node liveness reports that the node is not alive",
-			})
-			numNodes--
-			continue
-		}
+	// TODO(bram): consider abstracting out this repeated pattern.
+	for nodeID := range isLiveMap {
 		nodeID := nodeID
 		if err := s.stopper.RunAsyncTask(
-			nodeCtx, "server.statusServer: requesting remote ranges",
+			ctx, "server.statusServer: requesting remote ranges",
 			func(ctx context.Context) {
-				status, err := s.dialNode(nodeID)
+				status, err := s.dialNode(ctx, nodeID)
 				var rangesResponse *serverpb.RangesResponse
 				if err == nil {
-					req := &serverpb.RangesRequest{}
+					req := &serverpb.RangesRequest{
+						ProblemsOnly: true,
+					}
 					rangesResponse, err = status.Ranges(ctx, req)
 				}
 				response := nodeResponse{
@@ -95,62 +76,79 @@ func (s *statusServer) ProblemRanges(
 					// Context completed, response no longer needed.
 				}
 			}); err != nil {
-			return nil, grpc.Errorf(codes.Internal, err.Error())
+			return nil, status.Error(codes.Internal, err.Error())
 		}
 	}
-	for remainingResponses := numNodes; remainingResponses > 0; remainingResponses-- {
+
+	for remainingResponses := len(isLiveMap); remainingResponses > 0; remainingResponses-- {
 		select {
 		case resp := <-responses:
 			if resp.err != nil {
-				response.Failures = append(response.Failures, serverpb.Failure{
-					NodeID:       resp.nodeID,
+				response.ProblemsByNodeID[resp.nodeID] = serverpb.ProblemRangesResponse_NodeProblems{
 					ErrorMessage: resp.err.Error(),
-				})
+				}
 				continue
 			}
+			var problems serverpb.ProblemRangesResponse_NodeProblems
 			for _, info := range resp.resp.Ranges {
 				if len(info.ErrorMessage) != 0 {
-					response.Failures = append(response.Failures, serverpb.Failure{
-						NodeID:       info.SourceNodeID,
+					response.ProblemsByNodeID[resp.nodeID] = serverpb.ProblemRangesResponse_NodeProblems{
 						ErrorMessage: info.ErrorMessage,
-					})
+					}
 					continue
 				}
 				if info.Problems.Unavailable {
-					response.UnavailableRangeIDs =
-						append(response.UnavailableRangeIDs, info.State.Desc.RangeID)
+					problems.UnavailableRangeIDs =
+						append(problems.UnavailableRangeIDs, info.State.Desc.RangeID)
 				}
 				if info.Problems.LeaderNotLeaseHolder {
-					response.RaftLeaderNotLeaseHolderRangeIDs =
-						append(response.RaftLeaderNotLeaseHolderRangeIDs, info.State.Desc.RangeID)
+					problems.RaftLeaderNotLeaseHolderRangeIDs =
+						append(problems.RaftLeaderNotLeaseHolderRangeIDs, info.State.Desc.RangeID)
 				}
 				if info.Problems.NoRaftLeader {
-					noRaftLeader[info.State.Desc.RangeID] = struct{}{}
+					problems.NoRaftLeaderRangeIDs =
+						append(problems.NoRaftLeaderRangeIDs, info.State.Desc.RangeID)
 				}
 				if info.Problems.Underreplicated {
-					response.UnderreplicatedRangeIDs =
-						append(response.UnderreplicatedRangeIDs, info.State.Desc.RangeID)
+					problems.UnderreplicatedRangeIDs =
+						append(problems.UnderreplicatedRangeIDs, info.State.Desc.RangeID)
+				}
+				if info.Problems.Overreplicated {
+					problems.OverreplicatedRangeIDs =
+						append(problems.OverreplicatedRangeIDs, info.State.Desc.RangeID)
 				}
 				if info.Problems.NoLease {
-					response.NoLeaseRangeIDs =
-						append(response.NoLeaseRangeIDs, info.State.Desc.RangeID)
+					problems.NoLeaseRangeIDs =
+						append(problems.NoLeaseRangeIDs, info.State.Desc.RangeID)
+				}
+				if info.Problems.QuiescentEqualsTicking {
+					problems.QuiescentEqualsTickingRangeIDs =
+						append(problems.QuiescentEqualsTickingRangeIDs, info.State.Desc.RangeID)
+				}
+				if info.Problems.RaftLogTooLarge {
+					problems.RaftLogTooLargeRangeIDs =
+						append(problems.RaftLogTooLargeRangeIDs, info.State.Desc.RangeID)
+				}
+				if info.Problems.CircuitBreakerError {
+					problems.CircuitBreakerErrorRangeIDs =
+						append(problems.CircuitBreakerErrorRangeIDs, info.State.Desc.RangeID)
+				}
+				if info.Problems.PausedFollowers {
+					problems.PausedReplicaIDs =
+						append(problems.PausedReplicaIDs, info.State.Desc.RangeID)
+				}
+				if info.Problems.RangeTooLarge {
+					problems.TooLargeRangeIds =
+						append(problems.TooLargeRangeIds, info.State.Desc.RangeID)
 				}
 			}
+			// Note: Range IDs are already sorted because the Ranges RPC uses
+			// kvserver.WithReplicasInOrder() when visiting replicas.
+			response.ProblemsByNodeID[resp.nodeID] = problems
 		case <-ctx.Done():
-			return nil, grpc.Errorf(codes.DeadlineExceeded, ctx.Err().Error())
+			return nil, status.Error(codes.DeadlineExceeded, ctx.Err().Error())
 		}
 	}
-
-	for rangeID := range noRaftLeader {
-		response.NoRaftLeaderRangeIDs =
-			append(response.NoRaftLeaderRangeIDs, rangeID)
-	}
-
-	sort.Sort(roachpb.RangeIDSlice(response.UnavailableRangeIDs))
-	sort.Sort(roachpb.RangeIDSlice(response.RaftLeaderNotLeaseHolderRangeIDs))
-	sort.Sort(roachpb.RangeIDSlice(response.NoRaftLeaderRangeIDs))
-	sort.Sort(roachpb.RangeIDSlice(response.NoLeaseRangeIDs))
-	sort.Sort(roachpb.RangeIDSlice(response.UnderreplicatedRangeIDs))
 
 	return response, nil
 }

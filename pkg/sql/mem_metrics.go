@@ -1,18 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -22,18 +11,31 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 )
 
+// BaseMemoryMetrics contains a max histogram and a current count of the
+// bytes allocated by a sql endpoint.
+type BaseMemoryMetrics struct {
+	MaxBytesHist  metric.IHistogram
+	CurBytesCount *metric.Gauge
+}
+
+// MetricStruct implements the metrics.Struct interface.
+func (BaseMemoryMetrics) MetricStruct() {}
+
 // MemoryMetrics contains pointers to the metrics object
 // for one of the SQL endpoints:
 // - "client" for connections received via pgwire.
 // - "admin" for connections received via the admin RPC.
 // - "internal" for activities related to leases, schema changes, etc.
 type MemoryMetrics struct {
-	MaxBytesHist         *metric.Histogram
-	CurBytesCount        *metric.Counter
-	TxnMaxBytesHist      *metric.Histogram
-	TxnCurBytesCount     *metric.Counter
-	SessionMaxBytesHist  *metric.Histogram
-	SessionCurBytesCount *metric.Counter
+	BaseMemoryMetrics
+	TxnMaxBytesHist      metric.IHistogram
+	TxnCurBytesCount     *metric.Gauge
+	SessionMaxBytesHist  metric.IHistogram
+	SessionCurBytesCount *metric.Gauge
+
+	// For prepared statements.
+	SessionPreparedMaxBytesHist  metric.IHistogram
+	SessionPreparedCurBytesCount *metric.Gauge
 }
 
 // MetricStruct implements the metrics.Struct interface.
@@ -57,33 +59,64 @@ var _ metric.Struct = MemoryMetrics{}
 // log10int64times1000 = log10(math.MaxInt64) * 1000, rounded up somewhat
 const log10int64times1000 = 19 * 1000
 
+func makeMemMetricMetadata(name, help string) metric.Metadata {
+	return metric.Metadata{
+		Name:        name,
+		Help:        help,
+		Measurement: "Memory",
+		Unit:        metric.Unit_BYTES,
+	}
+}
+
+func makeMemMetricHistogram(
+	metadata metric.Metadata, histogramWindow time.Duration,
+) metric.IHistogram {
+	return metric.NewHistogram(metric.HistogramOptions{
+		Metadata:     metadata,
+		Duration:     histogramWindow,
+		MaxVal:       log10int64times1000,
+		SigFigs:      3,
+		BucketConfig: metric.MemoryUsage64MBBuckets,
+	})
+}
+
+// MakeBaseMemMetrics instantiates the metric objects for an SQL endpoint, but
+// only includes the root metrics: .max and .current, without txn and session.
+func MakeBaseMemMetrics(endpoint string, histogramWindow time.Duration) BaseMemoryMetrics {
+	prefix := "sql.mem." + endpoint
+	MetaMemMaxBytes := makeMemMetricMetadata(prefix+".max", "Memory usage per sql statement for "+endpoint)
+	MetaMemCurBytes := makeMemMetricMetadata(prefix+".current", "Current sql statement memory usage for "+endpoint)
+
+	// Add Essential flag and category if this is the 'root' endpoint.
+	if endpoint == "root" {
+		MetaMemCurBytes.Visibility = metric.Metadata_ESSENTIAL
+		MetaMemCurBytes.Category = metric.Metadata_SQL
+		MetaMemCurBytes.HowToUse = `This metric shows how memory set aside for temporary materializations, such as hash tables and intermediary result sets, is utilized. Use this metric to optimize memory allocations based on long term observations. The maximum amount is set with --max_sql_memory. If the utilization of sql memory is persistently low, perhaps some portion of this memory allocation can be shifted to --cache.`
+	}
+
+	return BaseMemoryMetrics{
+		MaxBytesHist:  makeMemMetricHistogram(MetaMemMaxBytes, histogramWindow),
+		CurBytesCount: metric.NewGauge(MetaMemCurBytes),
+	}
+}
+
 // MakeMemMetrics instantiates the metric objects for an SQL endpoint.
 func MakeMemMetrics(endpoint string, histogramWindow time.Duration) MemoryMetrics {
+	base := MakeBaseMemMetrics(endpoint, histogramWindow)
 	prefix := "sql.mem." + endpoint
-	MetaMemMaxBytes := metric.Metadata{
-		Name: prefix + ".max",
-		Help: "Memory usage per sql statement for " + endpoint}
-	MetaMemCurBytes := metric.Metadata{
-		Name: prefix + ".current",
-		Help: "Current sql statement memory usage for " + endpoint}
-	MetaMemMaxTxnBytes := metric.Metadata{
-		Name: prefix + ".txn.max",
-		Help: "Memory usage per sql transaction for " + endpoint}
-	MetaMemTxnCurBytes := metric.Metadata{
-		Name: prefix + ".txn.current",
-		Help: "Current sql transaction memory usage for " + endpoint}
-	MetaMemMaxSessionBytes := metric.Metadata{
-		Name: prefix + ".session.max",
-		Help: "Memory usage per sql session for " + endpoint}
-	MetaMemSessionCurBytes := metric.Metadata{
-		Name: prefix + ".session.current",
-		Help: "Current sql session memory usage for " + endpoint}
+	MetaMemMaxTxnBytes := makeMemMetricMetadata(prefix+".txn.max", "Memory usage per sql transaction for "+endpoint)
+	MetaMemTxnCurBytes := makeMemMetricMetadata(prefix+".txn.current", "Current sql transaction memory usage for "+endpoint)
+	MetaMemMaxSessionBytes := makeMemMetricMetadata(prefix+".session.max", "Memory usage per sql session for "+endpoint)
+	MetaMemSessionCurBytes := makeMemMetricMetadata(prefix+".session.current", "Current sql session memory usage for "+endpoint)
+	MetaMemMaxSessionPreparedBytes := makeMemMetricMetadata(prefix+".session.prepared.max", "Memory usage by prepared statements per sql session for "+endpoint)
+	MetaMemSessionPreparedCurBytes := makeMemMetricMetadata(prefix+".session.prepared.current", "Current sql session memory usage by prepared statements for "+endpoint)
 	return MemoryMetrics{
-		MaxBytesHist:         metric.NewHistogram(MetaMemMaxBytes, histogramWindow, log10int64times1000, 3),
-		CurBytesCount:        metric.NewCounter(MetaMemCurBytes),
-		TxnMaxBytesHist:      metric.NewHistogram(MetaMemMaxTxnBytes, histogramWindow, log10int64times1000, 3),
-		TxnCurBytesCount:     metric.NewCounter(MetaMemTxnCurBytes),
-		SessionMaxBytesHist:  metric.NewHistogram(MetaMemMaxSessionBytes, histogramWindow, log10int64times1000, 3),
-		SessionCurBytesCount: metric.NewCounter(MetaMemSessionCurBytes),
+		BaseMemoryMetrics:            base,
+		TxnMaxBytesHist:              makeMemMetricHistogram(MetaMemMaxTxnBytes, histogramWindow),
+		TxnCurBytesCount:             metric.NewGauge(MetaMemTxnCurBytes),
+		SessionMaxBytesHist:          makeMemMetricHistogram(MetaMemMaxSessionBytes, histogramWindow),
+		SessionCurBytesCount:         metric.NewGauge(MetaMemSessionCurBytes),
+		SessionPreparedMaxBytesHist:  makeMemMetricHistogram(MetaMemMaxSessionPreparedBytes, histogramWindow),
+		SessionPreparedCurBytesCount: metric.NewGauge(MetaMemSessionPreparedCurBytes),
 	}
 }

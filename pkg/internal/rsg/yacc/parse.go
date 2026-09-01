@@ -1,6 +1,14 @@
 // Copyright 2011 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// license that can be found in licenses/BSD-golang.txt.
+
+// Portions of this file are additionally subject to the following license
+// and copyright.
+//
+// Copyright 2016 The Cockroach Authors.
+//
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Copied from Go's text/template/parse package and modified for yacc.
 
@@ -10,6 +18,8 @@ package yacc
 import (
 	"fmt"
 	"runtime"
+
+	"github.com/cockroachdb/errors"
 )
 
 // Tree is the representation of a single parsed file.
@@ -67,8 +77,9 @@ func New(name string) *Tree {
 
 // errorf formats the error and terminates processing.
 func (t *Tree) errorf(format string, args ...interface{}) {
-	format = fmt.Sprintf("parse: %s:%d: %s", t.Name, t.lex.lineNumber(), format)
-	panic(fmt.Errorf(format, args...))
+	err := fmt.Errorf(format, args...)
+	err = errors.Wrapf(err, "parse: %s:%d", t.Name, t.lex.lineNumber())
+	panic(err)
 }
 
 // expect consumes the next token and guarantees it has the required type.

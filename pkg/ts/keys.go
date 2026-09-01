@@ -1,34 +1,24 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt.r.tracy@gmail.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ts
 
 import (
 	"bytes"
-	"fmt"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // Time series keys are carefully constructed to usefully sort the data in the
-// key-value store for the purpose of queries. Time series data is queryied by
+// key-value store for the purpose of queries. Time series data is queried by
 // providing a series name and a timespan; we therefore expose the series name
 // and the collection time prominently on the key.
 //
@@ -81,7 +71,8 @@ func makeDataKeySeriesPrefix(name string, r Resolution) roachpb.Key {
 	return k
 }
 
-// DecodeDataKey decodes a time series key into its components.
+// DecodeDataKey decodes a time series key into its components:
+// name, source, resolution, timestamp.
 func DecodeDataKey(key roachpb.Key) (string, string, Resolution, int64, error) {
 	// Detect and remove prefix.
 	remainder := key
@@ -118,15 +109,16 @@ func decodeDataKeySuffix(key roachpb.Key) (string, string, Resolution, int64, er
 	return string(name), string(source), resolution, timestamp, nil
 }
 
-func prettyPrintKey(key roachpb.Key) string {
+func prettyPrintKey(buf *redact.StringBuilder, key roachpb.Key) {
 	name, source, resolution, timestamp, err := decodeDataKeySuffix(key)
 	if err != nil {
 		// Not a valid timeseries key, fall back to doing the best we can to display
 		// it.
-		return encoding.PrettyPrintValue(key, "/")
+		encoding.PrettyPrintValue(buf, nil /* dirs */, key, "/")
+		return
 	}
-	return fmt.Sprintf("/%s/%s/%s/%s", name, source, resolution,
-		time.Unix(0, timestamp).UTC().Format(time.RFC3339Nano))
+	buf.Printf("/%s/%s/%s/%s", name, resolution,
+		redact.Safe(timeutil.Unix(0, timestamp).Format(time.RFC3339Nano)), source)
 }
 
 func init() {

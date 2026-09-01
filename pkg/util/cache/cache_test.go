@@ -1,30 +1,19 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 //
 // This code is based on: https://github.com/golang/groupcache/
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package cache
 
 import (
 	"bytes"
+	"context"
 	"reflect"
 	"testing"
 
 	"github.com/biogo/store/llrb"
-
 	_ "github.com/cockroachdb/cockroach/pkg/util/log" // for flags
 )
 
@@ -33,6 +22,12 @@ type testKey string
 // Compare implements llrb.Comparable.
 func (tk testKey) Compare(b llrb.Comparable) int {
 	return bytes.Compare([]byte(tk), []byte(b.(testKey)))
+}
+
+func intervalLogErrorf(t testing.TB) IntervalCacheLogErrorf {
+	return func(_ context.Context, f string, args ...interface{}) {
+		t.Logf(f, args...)
+	}
 }
 
 var getTests = []struct {
@@ -146,7 +141,11 @@ func TestCacheLRU(t *testing.T) {
 	if _, ok := mc.Get(testKey("a")); !ok {
 		t.Fatal("failed to get key a")
 	}
-	// Add another entry to evict; should evict key "b".
+	// Verify that a StealthyGet won't make b the most recently used.
+	if _, ok := mc.StealthyGet(testKey("b")); !ok {
+		t.Fatal("failed to get key b")
+	}
+	// Add another entry to cause an eviction; should evict key "b".
 	mc.Add(testKey("c"), 3)
 	// Verify eviction of least recently used key "b".
 	if _, ok := mc.Get(testKey("b")); ok {
@@ -215,6 +214,35 @@ func TestOrderedCache(t *testing.T) {
 	if _, v, ok := oc.Floor(testKey("c")); !ok || v.(int) != 2 {
 		t.Error("expected fetch of key \"b\" for floor of maximum key")
 	}
+
+	// Test do over entire cache.
+	expKeys, collectKeys := []string{"a", "b"}, []string{}
+	expVals, collectVals := []int{1, 2}, []int{}
+	collect := func(k, v interface{}) bool {
+		collectKeys = append(collectKeys, string(k.(testKey)))
+		collectVals = append(collectVals, v.(int))
+		return false
+	}
+
+	oc.Do(collect)
+	if !reflect.DeepEqual(expKeys, collectKeys) {
+		t.Errorf("expected do to find keys %v, found %v", expKeys, collectKeys)
+	}
+	if !reflect.DeepEqual(expVals, collectVals) {
+		t.Errorf("expected do to find values %v, found %v", expVals, collectVals)
+	}
+
+	// Test doRange over range ["a","b").
+	expKeys, collectKeys = []string{"a"}, []string{}
+	expVals, collectVals = []int{1}, []int{}
+
+	oc.DoRange(collect, testKey("a"), testKey("b"))
+	if !reflect.DeepEqual(expKeys, collectKeys) {
+		t.Errorf("expected do to find keys %v, found %v", expKeys, collectKeys)
+	}
+	if !reflect.DeepEqual(expVals, collectVals) {
+		t.Errorf("expected do to find values %v, found %v", expVals, collectVals)
+	}
 }
 
 func TestOrderedCacheClear(t *testing.T) {
@@ -235,7 +263,7 @@ func TestOrderedCacheClear(t *testing.T) {
 }
 
 func TestIntervalCache(t *testing.T) {
-	ic := NewIntervalCache(Config{Policy: CacheLRU, ShouldEvict: noEviction})
+	ic := NewIntervalCache(Config{Policy: CacheLRU, ShouldEvict: noEviction}, intervalLogErrorf(t))
 	key1 := ic.NewKey([]byte("a"), []byte("b"))
 	key2 := ic.NewKey([]byte("a"), []byte("c"))
 	key3 := ic.NewKey([]byte("d"), []byte("d\x00"))
@@ -265,7 +293,7 @@ func TestIntervalCache(t *testing.T) {
 }
 
 func TestIntervalCacheOverlap(t *testing.T) {
-	ic := NewIntervalCache(Config{Policy: CacheLRU, ShouldEvict: noEviction})
+	ic := NewIntervalCache(Config{Policy: CacheLRU, ShouldEvict: noEviction}, intervalLogErrorf(t))
 	ic.Add(ic.NewKey([]byte("a"), []byte("c")), 1)
 	ic.Add(ic.NewKey([]byte("c"), []byte("e")), 2)
 	ic.Add(ic.NewKey([]byte("b"), []byte("g")), 3)
@@ -288,7 +316,7 @@ func TestIntervalCacheOverlap(t *testing.T) {
 }
 
 func TestIntervalCacheClear(t *testing.T) {
-	ic := NewIntervalCache(Config{Policy: CacheLRU, ShouldEvict: noEviction})
+	ic := NewIntervalCache(Config{Policy: CacheLRU, ShouldEvict: noEviction}, intervalLogErrorf(t))
 	key1 := ic.NewKey([]byte("a"), []byte("c"))
 	key2 := ic.NewKey([]byte("c"), []byte("e"))
 	ic.Add(key1, 1)
@@ -310,7 +338,7 @@ func TestIntervalCacheClear(t *testing.T) {
 }
 
 func TestIntervalCacheClearWithAdjustedBounds(t *testing.T) {
-	ic := NewIntervalCache(Config{Policy: CacheLRU, ShouldEvict: noEviction})
+	ic := NewIntervalCache(Config{Policy: CacheLRU, ShouldEvict: noEviction}, intervalLogErrorf(t))
 	entry1 := &Entry{Key: ic.NewKey([]byte("a"), []byte("bb")), Value: 1}
 	ic.AddEntry(entry1)
 	entry1.Key.(*IntervalKey).End = []byte("b")
@@ -362,7 +390,7 @@ func BenchmarkOrderedCache(b *testing.B) {
 }
 
 func BenchmarkIntervalCache(b *testing.B) {
-	ic := NewIntervalCache(Config{Policy: CacheLRU, ShouldEvict: noEviction})
+	ic := NewIntervalCache(Config{Policy: CacheLRU, ShouldEvict: noEviction}, intervalLogErrorf(b))
 	testKeys := []interface{}{
 		ic.NewKey([]byte("a"), []byte("c")),
 		ic.NewKey([]byte("b"), []byte("d")),

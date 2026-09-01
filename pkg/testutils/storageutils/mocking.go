@@ -1,62 +1,57 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Andrei Matei (andreimatei1@gmail.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storageutils
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
+	"context"
+	"fmt"
+
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil/singleflight"
 )
 
 // raftCmdIDAndIndex identifies a batch and a command within it.
 type raftCmdIDAndIndex struct {
-	IDKey storagebase.CmdIDKey
+	IDKey kvserverbase.CmdIDKey
 	Index int
+}
+
+func (r raftCmdIDAndIndex) String() string {
+	return fmt.Sprintf("%s/%d", r.IDKey, r.Index)
 }
 
 // ReplayProtectionFilterWrapper wraps a CommandFilter and assures protection
 // from Raft replays.
 type ReplayProtectionFilterWrapper struct {
 	syncutil.Mutex
-	processedCommands map[raftCmdIDAndIndex]*roachpb.Error
-	filter            storagebase.ReplicaCommandFilter
+	inFlight          *singleflight.Group
+	processedCommands map[raftCmdIDAndIndex]*kvpb.Error
+	filter            kvserverbase.ReplicaCommandFilter
 }
 
 // WrapFilterForReplayProtection wraps a filter into another one that adds Raft
 // replay protection.
 func WrapFilterForReplayProtection(
-	filter storagebase.ReplicaCommandFilter,
-) storagebase.ReplicaCommandFilter {
+	filter kvserverbase.ReplicaCommandFilter,
+) kvserverbase.ReplicaCommandFilter {
 	wrapper := ReplayProtectionFilterWrapper{
-		processedCommands: make(map[raftCmdIDAndIndex]*roachpb.Error),
+		inFlight:          singleflight.NewGroup("replay-protection", "key"),
+		processedCommands: make(map[raftCmdIDAndIndex]*kvpb.Error),
 		filter:            filter,
 	}
 	return wrapper.run
 }
 
 // Errors are mutated on the Send path, so we must always return copies.
-func shallowCloneErrorWithTxn(pErr *roachpb.Error) *roachpb.Error {
+func shallowCloneErrorWithTxn(pErr *kvpb.Error) *kvpb.Error {
 	if pErr != nil {
 		pErrCopy := *pErr
-		txn := pErrCopy.GetTxn()
-		if txn != nil {
-			txnClone := txn.Clone()
-			pErrCopy.SetTxn(&txnClone)
-		}
+		pErrCopy.SetTxn(pErrCopy.GetTxn())
 		return &pErrCopy
 	}
 
@@ -64,24 +59,40 @@ func shallowCloneErrorWithTxn(pErr *roachpb.Error) *roachpb.Error {
 }
 
 // run executes the wrapped filter.
-func (c *ReplayProtectionFilterWrapper) run(args storagebase.FilterArgs) *roachpb.Error {
+func (c *ReplayProtectionFilterWrapper) run(args kvserverbase.FilterArgs) *kvpb.Error {
+	if !args.InRaftCmd() {
+		return c.filter(args)
+	}
+
 	mapKey := raftCmdIDAndIndex{args.CmdID, args.Index}
 
 	c.Lock()
-	defer c.Unlock()
-
-	if args.InRaftCmd() {
-		if pErr, ok := c.processedCommands[mapKey]; ok {
-			// We've detected a replay.
-			return shallowCloneErrorWithTxn(pErr)
-		}
+	if pErr, ok := c.processedCommands[mapKey]; ok {
+		c.Unlock()
+		return shallowCloneErrorWithTxn(pErr)
 	}
 
-	pErr := c.filter(args)
+	// We use the singleflight.Group to coalesce replayed raft commands onto the
+	// same filter call. This allows concurrent access to the filter for
+	// different raft commands.
+	future, _ := c.inFlight.DoChan(args.Ctx, mapKey.String(),
+		singleflight.DoOpts{
+			Stop:               nil,
+			InheritCancelation: true,
+		},
+		func(ctx context.Context) (interface{}, error) {
+			pErr := c.filter(args)
 
-	if args.InRaftCmd() {
-		c.processedCommands[mapKey] = pErr
+			c.Lock()
+			defer c.Unlock()
+			c.processedCommands[mapKey] = pErr
+			return pErr, nil
+		})
+	c.Unlock()
+
+	res := future.WaitForResult(args.Ctx)
+	if res.Err != nil {
+		return kvpb.NewError(res.Err)
 	}
-
-	return shallowCloneErrorWithTxn(pErr)
+	return shallowCloneErrorWithTxn(res.Val.(*kvpb.Error))
 }

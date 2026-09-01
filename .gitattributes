@@ -1,7 +1,4 @@
-*.pb.* -diff
-embedded.go -diff
-pkg/sql/parser/sql.go -diff
-pkg/ui/src/js/protos.* -diff
-pkg/ui/generated/* -diff
-pkg/ui/yarn.lock -merge
-Gopkg.toml -merge
+.aspect/** -diff
+build/bazelutil/distdir_files.bzl -diff
+pkg/BUILD.bazel -diff
+pkg/protos.bzl -diff

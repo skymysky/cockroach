@@ -1,671 +1,1195 @@
-// Copyright 2015 The Cockroach Authors.
+// Copyright 2024 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
-// Author: Bram Gruneir (bram+code@cockroachlabs.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
 import (
-	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
-	"path/filepath"
-	"reflect"
-	"regexp"
-	"strconv"
+	"os"
+	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/build"
-	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/plan"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
-	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/server/authserver"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
-	"github.com/cockroachdb/cockroach/pkg/server/status"
-	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/contention"
+	"github.com/cockroachdb/cockroach/pkg/sql/contentionpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/insights"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/insightspb"
+	tablemetadatacacheutil "github.com/cockroachdb/cockroach/pkg/sql/tablemetadatacache/util"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/ts"
-	"github.com/cockroachdb/cockroach/pkg/util/httputil"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func getStatusJSONProto(
-	ts serverutils.TestServerInterface, path string, response proto.Message,
-) error {
-	return serverutils.GetJSONProto(ts, statusPrefix+path, response)
-}
-
-// TestStatusLocalStacks verifies that goroutine stack traces are available
-// via the /_status/stacks/local endpoint.
-func TestStatusLocalStacks(t *testing.T) {
+// TestDetailsRemoteNode verifies that requesting details for a remote node
+// returns the correct node information.
+func TestDetailsRemoteNode(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer log.Scope(t).Close(t)
 
-	// Verify match with at least two goroutine stacks.
-	re := regexp.MustCompile("(?s)goroutine [0-9]+.*goroutine [0-9]+.*")
+	ctx := context.Background()
 
-	var stacks serverpb.JSONResponse
-	for _, nodeID := range []string{"local", "1"} {
-		if err := getStatusJSONProto(s, "stacks/"+nodeID, &stacks); err != nil {
-			t.Fatal(err)
-		}
-		if !re.Match(stacks.Data) {
-			t.Errorf("expected %s to match %s", stacks.Data, re)
+	// Start a 3 node cluster
+	tc := serverutils.StartCluster(t, 3, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			// Use in-memory stores
+			StoreSpecs: []base.StoreSpec{{InMemory: true}},
+		},
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	// Create a map of nodeID to status server for each node.
+	statusServers := make(map[roachpb.NodeID]*systemStatusServer)
+	for i := 0; i < 3; i++ {
+		nodeID := tc.Server(i).NodeID()
+		statusServers[nodeID] = tc.Server(i).StatusServer().(*systemStatusServer)
+	}
+
+	// For each status server, request details about every node and verify the response.
+	for serverNodeID, statusServer := range statusServers {
+		// Verify local returns the same node id.
+		res, err := statusServer.Details(ctx, &serverpb.DetailsRequest{
+			NodeId: "local",
+		})
+		require.NoError(t, err)
+		require.Equal(t, serverNodeID, res.NodeID,
+			"status server on node %d returned wrong nodeID for node %d",
+			serverNodeID, serverNodeID)
+
+		// Verify specifying a node id returns the same id in the response.
+		for expectedNodeID := range statusServers {
+			res, err := statusServer.Details(ctx, &serverpb.DetailsRequest{
+				NodeId: expectedNodeID.String(),
+			})
+			require.NoError(t, err)
+			require.Equal(t, expectedNodeID, res.NodeID,
+				"status server on node %d returned wrong nodeID for node %d",
+				serverNodeID, expectedNodeID)
 		}
 	}
 }
 
-// TestStatusJson verifies that status endpoints return expected Json results.
-// The content type of the responses is always httputil.JSONContentType.
-func TestStatusJson(t *testing.T) {
+// TestDetailsRedacted checks if the `DetailsResponse` contains redacted fields
+// when the `Redact` flag is set in the `DetailsRequest`
+func TestDetailsRedacted(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
-	ts := s.(*TestServer)
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	server := serverutils.StartServerOnly(t, base.TestServerArgs{})
 
-	nodeID := ts.Gossip().NodeID.Get()
-	addr, err := ts.Gossip().GetNodeIDAddress(nodeID)
-	if err != nil {
-		t.Fatal(err)
+	defer server.Stopper().Stop(ctx)
+
+	// Override cluster setting for this test
+	DebugZipRedactAddressesEnabled.Override(ctx, &server.ClusterSettings().SV, true)
+
+	s := server.StatusServer().(*systemStatusServer)
+	res, err := s.Details(ctx, &serverpb.DetailsRequest{
+		NodeId: "local",
+		Redact: true,
+	})
+	require.NoError(t, err)
+
+	jsonResponse, _ := json.Marshal(res)
+	hostname, _ := os.Hostname()
+
+	require.Equal(t, redactedMarker, res.Address.AddressField)
+	require.Equal(t, redactedMarker, res.SQLAddress.AddressField)
+	require.NotContains(t, string(jsonResponse), hostname)
+}
+
+// TestDetailsUnredacted checks if the `DetailsResponse` contains un-redacted fields
+// when the `Redact` flag is not set in the `DetailsRequest`
+func TestDetailsUnredacted(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	server := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer server.Stopper().Stop(ctx)
+
+	s := server.StatusServer().(*systemStatusServer)
+	res, err := s.Details(ctx, &serverpb.DetailsRequest{
+		NodeId: "local",
+	})
+	require.NoError(t, err)
+
+	require.NotEqual(t, redactedMarker, res.Address.AddressField)
+	require.NotEqual(t, redactedMarker, res.SQLAddress.AddressField)
+}
+
+// TestNodesListRedacted checks if the `NodesListResponse` contains redacted fields
+// when the `Redact` flag is set in the `NodesListRequest`
+func TestNodesListRedacted(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	server := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer server.Stopper().Stop(ctx)
+
+	// Override cluster setting for this test
+	DebugZipRedactAddressesEnabled.Override(ctx, &server.ClusterSettings().SV, true)
+
+	s := server.StatusServer().(*systemStatusServer)
+	res, err := s.NodesList(ctx, &serverpb.NodesListRequest{
+		Redact: true,
+	})
+	require.NoError(t, err)
+
+	jsonResponse, _ := json.Marshal(res)
+	hostname, _ := os.Hostname()
+
+	require.NotContains(t, string(jsonResponse), hostname)
+
+	for i := range res.Nodes {
+		require.Equal(t, redactedMarker, res.Nodes[i].Address.AddressField)
+		require.Equal(t, redactedMarker, res.Nodes[i].SQLAddress.AddressField)
+	}
+}
+
+// TestNodesListUnredacted checks if the `NodesListResponse` contains un-redacted fields
+// when the `Redact` flag is not set in the `NodesListRequest`
+func TestNodesListUnredacted(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	server := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer server.Stopper().Stop(ctx)
+
+	s := server.StatusServer().(*systemStatusServer)
+	res, err := s.NodesList(ctx, &serverpb.NodesListRequest{})
+	require.NoError(t, err)
+
+	for i := range res.Nodes {
+		require.NotEqual(t, redactedMarker, res.Nodes[i].Address.AddressField)
+		require.NotEqual(t, redactedMarker, res.Nodes[i].SQLAddress.AddressField)
+	}
+}
+
+// TestNodesRedacted checks if the `NodesResponse` contains redacted fields
+// when the `Redact` flag is set in the `NodesRequest`
+func TestNodesRedacted(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	server := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer server.Stopper().Stop(ctx)
+
+	// Override cluster setting for this test
+	DebugZipRedactAddressesEnabled.Override(ctx, &server.ClusterSettings().SV, true)
+
+	s := server.StatusServer().(*systemStatusServer)
+	res, err := s.Nodes(ctx, &serverpb.NodesRequest{Redact: true})
+	require.NoError(t, err)
+
+	jsonResponse, _ := json.Marshal(res)
+	hostname, _ := os.Hostname()
+
+	require.NotContains(t, string(jsonResponse), hostname)
+
+	for i := range res.Nodes {
+		require.Equal(t, redactedMarker, res.Nodes[i].Desc.Address.AddressField)
+		require.Equal(t, redactedMarker, res.Nodes[i].Desc.SQLAddress.AddressField)
+		require.Equal(t, redactedMarker, res.Nodes[i].Desc.HTTPAddress.AddressField)
+
+		for j := range res.Nodes[i].Desc.Locality.Tiers {
+			require.Equal(t, redactedMarker, res.Nodes[0].Desc.Locality.Tiers[j].Value)
+		}
+
+		for j := range res.Nodes[i].StoreStatuses {
+			require.Equal(t, redactedMarker, res.Nodes[i].StoreStatuses[j].Desc.Node.Address.AddressField)
+			require.Equal(t, redactedMarker, res.Nodes[i].StoreStatuses[j].Desc.Node.SQLAddress.AddressField)
+			require.Equal(t, redactedMarker, res.Nodes[i].StoreStatuses[j].Desc.Node.HTTPAddress.AddressField)
+
+			for k := range res.Nodes[i].StoreStatuses[j].Desc.Node.Locality.Tiers {
+				require.Equal(t, redactedMarker, res.Nodes[i].StoreStatuses[j].Desc.Node.Locality.Tiers[k].Value)
+			}
+		}
+	}
+}
+
+// TestNodesUnredacted checks if the `NodesResponse` contains un-redacted fields
+// when the `Redact` flag is not set in the `NodesRequest`
+func TestNodesUnredacted(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	server := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer server.Stopper().Stop(ctx)
+
+	s := server.StatusServer().(*systemStatusServer)
+	res, err := s.Nodes(ctx, &serverpb.NodesRequest{})
+	require.NoError(t, err)
+
+	for i := range res.Nodes {
+		require.NotEqual(t, redactedMarker, res.Nodes[i].Desc.Address.AddressField)
+		require.NotEqual(t, redactedMarker, res.Nodes[i].Desc.SQLAddress.AddressField)
+		require.NotEqual(t, redactedMarker, res.Nodes[i].Desc.HTTPAddress.AddressField)
+
+		for j := range res.Nodes[i].Desc.Locality.Tiers {
+			require.NotEqual(t, redactedMarker, res.Nodes[0].Desc.Locality.Tiers[j].Value)
+		}
+
+		for j := range res.Nodes[i].StoreStatuses {
+			require.NotEqual(t, redactedMarker, res.Nodes[i].StoreStatuses[j].Desc.Node.Address.AddressField)
+			require.NotEqual(t, redactedMarker, res.Nodes[i].StoreStatuses[j].Desc.Node.SQLAddress.AddressField)
+			require.NotEqual(t, redactedMarker, res.Nodes[i].StoreStatuses[j].Desc.Node.HTTPAddress.AddressField)
+
+			for k := range res.Nodes[i].StoreStatuses[j].Desc.Node.Locality.Tiers {
+				require.NotEqual(t, redactedMarker, res.Nodes[i].StoreStatuses[j].Desc.Node.Locality.Tiers[k].Value)
+			}
+		}
+	}
+}
+
+func TestRedactNodesResponse(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	server := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer server.Stopper().Stop(ctx)
+
+	resp := serverpb.NodesResponse{
+		Nodes: []statuspb.NodeStatus{
+			{
+				Desc: roachpb.NodeDescriptor{
+					Address: util.UnresolvedAddr{
+						AddressField: "127.0.0.1:5328",
+					},
+					SQLAddress: util.UnresolvedAddr{
+						AddressField: "127.0.0.1:5328",
+					},
+					HTTPAddress: util.UnresolvedAddr{
+						AddressField: "127.0.0.1:5328",
+					},
+					Locality: roachpb.Locality{},
+				},
+				StoreStatuses: []statuspb.StoreStatus{
+					{
+						Desc: roachpb.StoreDescriptor{
+							Node: roachpb.NodeDescriptor{
+								Address: util.UnresolvedAddr{
+									AddressField: "127.0.0.1:5328",
+								},
+								SQLAddress: util.UnresolvedAddr{
+									AddressField: "127.0.0.1:5328",
+								},
+								HTTPAddress: util.UnresolvedAddr{
+									AddressField: "http://127.0.0.1/abcd",
+								},
+								Locality: roachpb.Locality{
+									Tiers: []roachpb.Tier{
+										{
+											Key:   "dns",
+											Value: "127.0.0.1:5328",
+										},
+										{
+											Key:   "abc",
+											Value: "127.0.0.1:5328",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 
-	var nodes serverpb.NodesResponse
-	testutils.SucceedsSoon(t, func() error {
-		if err := getStatusJSONProto(s, "nodes", &nodes); err != nil {
-			t.Fatal(err)
+	s := server.StatusServer().(*systemStatusServer)
+	res := s.redactNodesResponse(&resp)
+
+	for i := range res.Nodes {
+		require.Equal(t, redactedMarker, res.Nodes[i].Desc.Address.AddressField)
+		require.Equal(t, redactedMarker, res.Nodes[i].Desc.SQLAddress.AddressField)
+		require.Equal(t, redactedMarker, res.Nodes[i].Desc.HTTPAddress.AddressField)
+
+		for j := range res.Nodes[i].Desc.Locality.Tiers {
+			require.Equal(t, redactedMarker, res.Nodes[0].Desc.Locality.Tiers[j].Value)
 		}
 
-		if len(nodes.Nodes) == 0 {
-			return errors.Errorf("expected non-empty node list, got: %v", nodes)
+		for j := range res.Nodes[i].StoreStatuses {
+			require.Equal(t, redactedMarker, res.Nodes[i].StoreStatuses[j].Desc.Node.Address.AddressField)
+			require.Equal(t, redactedMarker, res.Nodes[i].StoreStatuses[j].Desc.Node.SQLAddress.AddressField)
+			require.Equal(t, redactedMarker, res.Nodes[i].StoreStatuses[j].Desc.Node.HTTPAddress.AddressField)
+
+			for k := range res.Nodes[i].StoreStatuses[j].Desc.Node.Locality.Tiers {
+				require.Equal(t, redactedMarker, res.Nodes[i].StoreStatuses[j].Desc.Node.Locality.Tiers[k].Value)
+			}
 		}
-		return nil
+	}
+}
+
+// TestNodeStatusRedacted checks if the `NodeResponse` contains redacted fields
+// when the `Redact` flag is set in the `NodeRequest`
+func TestNodeStatusRedacted(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	server := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer server.Stopper().Stop(ctx)
+
+	// Override cluster setting for this test
+	DebugZipRedactAddressesEnabled.Override(ctx, &server.ClusterSettings().SV, true)
+
+	s := server.StatusServer().(*systemStatusServer)
+	res, err := s.Node(ctx, &serverpb.NodeRequest{Redact: true})
+	require.NoError(t, err)
+
+	jsonResponse, _ := json.Marshal(res)
+	hostname, _ := os.Hostname()
+
+	require.NotContains(t, string(jsonResponse), hostname)
+	require.Equal(t, redactedMarker, res.Desc.Address.AddressField)
+	require.Equal(t, redactedMarker, res.Desc.SQLAddress.AddressField)
+}
+
+// TestNodeStatusUnredacted checks if the `NodeResponse` contains un-redacted fields
+// when the `Redact` flag is not set in the `NodeRequest`
+func TestNodeStatusUnredacted(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	server := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer server.Stopper().Stop(ctx)
+
+	s := server.StatusServer().(*systemStatusServer)
+	res, err := s.Node(ctx, &serverpb.NodeRequest{})
+	require.NoError(t, err)
+
+	require.NotEqual(t, redactedMarker, res.Desc.Address.AddressField)
+	require.NotEqual(t, redactedMarker, res.Desc.SQLAddress.AddressField)
+}
+
+// TestRangesRedacted checks if the `RangesResponse` contains redacted fields
+// when the `Redact` flag is set in the `RangesRequest`
+func TestRangesRedacted(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	server := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer server.Stopper().Stop(ctx)
+
+	// Override cluster setting for this test
+	DebugZipRedactAddressesEnabled.Override(ctx, &server.ClusterSettings().SV, true)
+
+	s := server.StatusServer().(*systemStatusServer)
+	res, err := s.Ranges(ctx, &serverpb.RangesRequest{Redact: true})
+	require.NoError(t, err)
+
+	jsonResponse, _ := json.Marshal(res)
+	hostname, _ := os.Hostname()
+
+	require.NotContains(t, string(jsonResponse), hostname)
+
+	for i := range res.Ranges {
+		for j := range res.Ranges[i].Locality.Tiers {
+			if res.Ranges[i].Locality.Tiers[j].Key == "dns" {
+				require.Equal(t, redactedMarker, res.Ranges[i].Locality.Tiers[j].Value)
+			}
+		}
+	}
+}
+
+// TestRangesUnredacted checks if the `RangesResponse` contains un-redacted fields
+// when the `Redact` flag is not set in the `RangesRequest`
+func TestRangesUnredacted(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	server := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer server.Stopper().Stop(ctx)
+
+	s := server.StatusServer().(*systemStatusServer)
+	res, err := s.Ranges(ctx, &serverpb.RangesRequest{})
+	require.NoError(t, err)
+
+	for i := range res.Ranges {
+		for j := range res.Ranges[i].Locality.Tiers {
+			if res.Ranges[i].Locality.Tiers[j].Key == "dns" {
+				require.NotEqual(t, redactedMarker, res.Ranges[i].Locality.Tiers[j].Value)
+			}
+		}
+	}
+}
+
+// TestRangesProblemsOnly checks that when ProblemsOnly is set, the response
+// contains only the fields needed for problem detection (State, Problems,
+// SourceNodeID, SourceStoreID) and omits expensive fields like RaftState,
+// LeaseHistory, Stats, Locality, etc.
+func TestRangesProblemsOnly(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	server := serverutils.StartServerOnly(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			Store: &kvserver.StoreTestingKnobs{
+				DisableSplitQueue: true,
+				DisableMergeQueue: true,
+			},
+		},
+	})
+	defer server.Stopper().Stop(ctx)
+
+	// Create a table and split it to ensure we have multiple ranges.
+	conn := sqlutils.MakeSQLRunner(server.ApplicationLayer().SQLConn(t))
+	conn.Exec(t, "CREATE TABLE test_ranges (k INT PRIMARY KEY)")
+	conn.Exec(t, "ALTER TABLE test_ranges SPLIT AT VALUES (100), (200)")
+
+	s := server.StatusServer().(*systemStatusServer)
+
+	// Get response with ProblemsOnly=true
+	resProblemsOnly, err := s.Ranges(ctx, &serverpb.RangesRequest{ProblemsOnly: true})
+	require.NoError(t, err)
+	require.Greater(t, len(resProblemsOnly.Ranges), 1, "expected multiple ranges")
+
+	// Get response with ProblemsOnly=false for comparison
+	resFull, err := s.Ranges(ctx, &serverpb.RangesRequest{ProblemsOnly: false})
+	require.NoError(t, err)
+	require.NotEmpty(t, resFull.Ranges)
+
+	// Verify both responses have the same number of ranges
+	require.Equal(t, len(resFull.Ranges), len(resProblemsOnly.Ranges))
+
+	for i, r := range resProblemsOnly.Ranges {
+		// Essential fields should be populated
+		require.NotNil(t, r.State.Desc, "State.Desc should be populated")
+		require.NotZero(t, r.State.Desc.RangeID, "RangeID should be set")
+		require.NotZero(t, r.SourceNodeID, "SourceNodeID should be set")
+		require.NotZero(t, r.SourceStoreID, "SourceStoreID should be set")
+		// Problems struct is always present (even if all false)
+
+		// Expensive fields should be zero/empty
+		require.Empty(t, r.RaftState.State, "RaftState should be empty when ProblemsOnly=true")
+		require.Empty(t, r.LeaseHistory, "LeaseHistory should be empty when ProblemsOnly=true")
+		require.Zero(t, r.Stats.QueriesPerSecond, "Stats should be zero when ProblemsOnly=true")
+		require.Nil(t, r.Locality, "Locality should be nil when ProblemsOnly=true")
+		require.Empty(t, r.TopKLocksByWaitQueueWaiters, "TopKLocksByWaitQueueWaiters should be empty when ProblemsOnly=true")
+		require.Empty(t, r.Span.StartKey, "Span should be empty when ProblemsOnly=true")
+
+		// Verify the full response has these fields populated for comparison
+		fullRange := resFull.Ranges[i]
+		require.NotEmpty(t, fullRange.RaftState.State, "Full response should have RaftState")
+		require.NotEmpty(t, fullRange.Span.StartKey, "Full response should have Span")
+	}
+}
+
+// TestGossipRedacted checks if the `GossipResponse` contains redacted fields
+// when the `Redact` flag is set in the `GossipRequest`
+func TestGossipRedacted(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	server := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer server.Stopper().Stop(ctx)
+
+	// Override cluster setting for this test
+	DebugZipRedactAddressesEnabled.Override(ctx, &server.ClusterSettings().SV, true)
+
+	s := server.StatusServer().(*systemStatusServer)
+	res, err := s.Gossip(ctx, &serverpb.GossipRequest{
+		Redact: true,
+	})
+	require.NoError(t, err)
+
+	jsonResponse, _ := json.Marshal(res)
+	hostname, _ := os.Hostname()
+
+	require.NotContains(t, string(jsonResponse), hostname)
+
+	for i := range res.Server.ConnStatus {
+		require.Equal(t, redactedMarker, res.Server.ConnStatus[i].Address)
+	}
+}
+
+// TestGossipUnredacted checks if the `GossipResponse` contains un-redacted fields
+// when the `Redact` flag is not set in the `GossipRequest`
+func TestGossipUnredacted(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	server := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer server.Stopper().Stop(ctx)
+
+	s := server.StatusServer().(*systemStatusServer)
+	res, err := s.Gossip(ctx, &serverpb.GossipRequest{})
+	require.NoError(t, err)
+
+	for i := range res.Server.ConnStatus {
+		require.NotEqual(t, redactedMarker, res.Server.ConnStatus[i].Address)
+	}
+}
+
+// TestListExecutionInsightsWhileEvictingInsights is a regression test
+// for #130290. It verifies that the status server does not panic when
+// listing execution insights while the system is evicting insights.
+func TestListExecutionInsightsWhileEvictingInsights(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	server := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer server.Stopper().Stop(ctx)
+
+	s := server.StatusServer().(*systemStatusServer)
+	insights.ExecutionInsightsCapacity.Override(ctx, &server.ClusterSettings().SV, 5)
+	insights.LatencyThreshold.Override(ctx, &server.ClusterSettings().SV, 1*time.Millisecond)
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	conn := sqlutils.MakeSQLRunner(server.ApplicationLayer().SQLConn(t))
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 500; i++ {
+			conn.Exec(t, "SELECT * FROM system.users")
+		}
+	}()
+
+	conn2 := sqlutils.MakeSQLRunner(server.ApplicationLayer().SQLConn(t))
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 500; i++ {
+			conn2.Exec(t, "SELECT * FROM system.users")
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			require.NotPanics(t, func() {
+				_, err := s.ListExecutionInsights(ctx, &serverpb.ListExecutionInsightsRequest{})
+				require.NoError(t, err)
+			})
+		}
+	}()
+
+	wg.Wait()
+}
+
+// TestLocalExecutionInsights tests the helper functions used by localExecutionInsights
+func TestLocalExecutionInsights(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	t.Run("validContentionInsights", func(t *testing.T) {
+		id1 := uuid.MakeV4()
+		id2 := uuid.MakeV4()
+		id3 := uuid.MakeV4()
+		insights := map[uuid.UUID]insightspb.Insight{
+			id1: {},
+			id2: {},
+			id3: {},
+		}
+		// id1 insight has no contention events.
+		// id2 insight has a contention event that is not resolved.
+		// id3 insight has multiple contention events, one of them is resolved.
+		events := []contentionpb.ExtendedContentionEvent{
+			{
+				WaitingTxnID: id2,
+			},
+			{
+				WaitingTxnID: id3,
+			},
+			{
+				WaitingTxnID:             id3,
+				BlockingTxnFingerprintID: 1234,
+			},
+		}
+
+		st := cluster.MakeTestingClusterSettings()
+		m := contention.NewMetrics()
+		registry := contention.NewRegistry(st, nil, &m)
+		registry.AddEventsForTest(events)
+		valid, err := validContentionInsights(registry, insights)
+		require.NoError(t, err)
+		// Only id3 should be returned.
+		require.Equal(t, 1, len(valid))
+		_, exists := valid[id3]
+		require.True(t, exists)
+	})
+}
+
+// TestStatusUpdateTableMetadataCache tests that signalling the update
+// table metadata cache job via the status server triggers the update
+// table metadata job to run.
+func TestStatusUpdateTableMetadataCache(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	var zeroDuration time.Duration
+	jobCompleteCh := make(chan struct{})
+	ctx := context.Background()
+	tc := serverutils.StartCluster(t, 3, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			Knobs: base.TestingKnobs{
+				JobsTestingKnobs: &jobs.TestingKnobs{
+					IntervalOverrides: jobs.TestingIntervalOverrides{
+						Adopt: &zeroDuration,
+					}},
+				TableMetadata: &tablemetadatacacheutil.TestingKnobs{
+					TableMetadataUpdater: &tablemetadatacacheutil.NoopUpdater{},
+					OnJobComplete: func() {
+						jobCompleteCh <- struct{}{}
+					},
+				},
+			},
+		},
+	})
+	defer tc.Stopper().Stop(context.Background())
+
+	conn := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+
+	t.Run("gated on admin privilege", func(t *testing.T) {
+		authCtx := authserver.ForwardHTTPAuthInfoToRPCCalls(authserver.ContextWithHTTPAuthInfo(ctx, username.TestUser, 1), nil)
+		_, err := tc.Server(0).GetStatusClient(t).UpdateTableMetadataCache(authCtx,
+			&serverpb.UpdateTableMetadataCacheRequest{Local: false})
+		require.Truef(t, testutils.IsError(err, updateTableMetadataCachePermissionErrMsg), "received error: %v", err)
 	})
 
-	for _, path := range []string{
-		"/health",
-		statusPrefix + "details/local",
-		statusPrefix + "details/" + strconv.FormatUint(uint64(nodeID), 10),
-	} {
-		var details serverpb.DetailsResponse
-		if err := serverutils.GetJSONProto(s, path, &details); err != nil {
-			t.Fatal(err)
+	t.Run("triggers update table metadata cache job", func(t *testing.T) {
+		// Get the node id that claimed the update job. We'll issue the
+		// RPC to a node that doesn't own the job to test that the RPC can
+		// propagate the request to the correct node.
+		var nodeID int
+		testutils.SucceedsSoon(t, func() error {
+			row := conn.Query(t, `
+SELECT claim_instance_id FROM system.jobs 
+WHERE id = $1 AND claim_instance_id IS NOT NULL`, jobs.UpdateTableMetadataCacheJobID)
+			if !row.Next() {
+				return errors.New("no node has claimed the job")
+			}
+			require.NoError(t, row.Scan(&nodeID))
+
+			rpcGatewayNode := (nodeID + 1) % 3
+			_, err := tc.Server(rpcGatewayNode).GetStatusClient(t).UpdateTableMetadataCache(ctx,
+				&serverpb.UpdateTableMetadataCacheRequest{Local: false})
+			if err != nil {
+				return err
+			}
+			// The job shouldn't be busy.
+			return nil
+		})
+
+		// Wait for the job to complete.
+		t.Log("waiting for job to complete")
+		<-jobCompleteCh
+		t.Log("job completed")
+
+		row := conn.Query(t,
+			`SELECT running_status FROM crdb_internal.jobs WHERE job_id = $1 AND running_status IS NOT NULL`,
+			jobs.UpdateTableMetadataCacheJobID)
+		if !row.Next() {
+			t.Fatal("last_run_time not updated")
 		}
-		if a, e := details.NodeID, nodeID; a != e {
-			t.Errorf("expected: %d, got: %d", e, a)
-		}
-		if a, e := details.Address, *addr; a != e {
-			t.Errorf("expected: %v, got: %v", e, a)
-		}
-		if a, e := details.BuildInfo, build.GetInfo(); a != e {
-			t.Errorf("expected: %v, got: %v", e, a)
-		}
-	}
+		var status string
+		require.NoError(t, row.Scan(&status))
+		require.Containsf(t, status, "Job completed at", "status not updated: %s", status)
+	})
 }
 
-// TestStatusGossipJson ensures that the output response for the full gossip
-// info contains the required fields.
-func TestStatusGossipJson(t *testing.T) {
+// TestNodesUiMetrics tests that the metrics fields of NodesUI
+// rpcs only returns the subset of metrics needed in the UI
+func TestNodesUiMetrics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer log.Scope(t).Close(t)
 
-	var data gossip.InfoStatus
-	if err := getStatusJSONProto(s, "gossip/local", &data); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := data.Infos["first-range"]; !ok {
-		t.Errorf("no first-range info returned: %v", data)
-	}
-	if _, ok := data.Infos["cluster-id"]; !ok {
-		t.Errorf("no clusterID info returned: %v", data)
-	}
-	if _, ok := data.Infos["node:1"]; !ok {
-		t.Errorf("no node 1 info returned: %v", data)
-	}
-	if _, ok := data.Infos["system-db"]; !ok {
-		t.Errorf("no system config info returned: %v", data)
+	ts := serverutils.StartServerOnly(t, base.TestServerArgs{})
+
+	ctx := context.Background()
+	defer ts.Stopper().Stop(ctx)
+
+	s := ts.StatusServer().(*systemStatusServer)
+	resp, err := s.NodesUI(ctx, &serverpb.NodesRequest{})
+	require.NoError(t, err)
+	require.Len(t, resp.Nodes, 1)
+	for _, node := range resp.Nodes {
+		for _, m := range uiNodeMetrics {
+			require.Contains(t, node.Metrics, m)
+		}
+		require.Greater(t, len(node.StoreStatuses), 0)
+		for _, storeStatus := range node.StoreStatuses {
+			for _, m := range uiStoreMetrics {
+				require.Contains(t, storeStatus.Metrics, m)
+			}
+		}
 	}
 }
 
-// startServer will start a server with a short scan interval, wait for
-// the scan to complete, and return the server. The caller is
-// responsible for stopping the server.
-func startServer(t *testing.T) *TestServer {
-	tsI, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{
+func responseHasTable(hr *serverpb.HotRangesResponseV2, table string) bool {
+	for _, r := range hr.Ranges {
+		if slices.Contains(r.Tables, table) {
+			// assert non-zero range
+			if r.RangeID != 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func TestHotRangesPayload(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	sc := log.ScopeWithoutShowLogs(t)
+	defer sc.Close(t)
+
+	ctx := context.Background()
+
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
 		StoreSpecs: []base.StoreSpec{
 			base.DefaultTestStoreSpec,
 			base.DefaultTestStoreSpec,
 			base.DefaultTestStoreSpec,
 		},
+		Knobs: base.TestingKnobs{
+			Store: &kvserver.StoreTestingKnobs{
+				ReplicaPlannerKnobs: plan.ReplicaPlannerTestingKnobs{
+					DisableReplicaRebalancing: true,
+				},
+			},
+		},
 	})
+	defer s.Stopper().Stop(ctx)
 
-	ts := tsI.(*TestServer)
-
-	// Make sure the range is spun up with an arbitrary read command. We do not
-	// expect a specific response.
-	if _, err := kvDB.Get(context.TODO(), "a"); err != nil {
-		t.Fatal(err)
-	}
-
-	// Make sure the node status is available. This is done by forcing stores to
-	// publish their status, synchronizing to the event feed with a canary
-	// event, and then forcing the server to write summaries immediately.
-	if err := ts.node.computePeriodicMetrics(context.TODO(), 0); err != nil {
-		t.Fatalf("error publishing store statuses: %s", err)
-	}
-
-	if err := ts.WriteSummaries(); err != nil {
-		t.Fatalf("error writing summaries: %s", err)
-	}
-
-	return ts
-}
-
-// TestStatusLocalLogs checks to ensure that local/logfiles,
-// local/logfiles/{filename} and local/log function
-// correctly.
-func TestStatusLocalLogs(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	if log.V(3) {
-		t.Skip("Test only works with low verbosity levels")
-	}
-
-	s := log.ScopeWithoutShowLogs(t)
-	defer s.Close(t)
-
-	ts := startServer(t)
-	defer ts.Stopper().Stop(context.TODO())
-
-	// Log an error of each main type which we expect to be able to retrieve.
-	// The resolution of our log timestamps is such that it's possible to get
-	// two subsequent log messages with the same timestamp. This test will fail
-	// when that occurs. By adding a small sleep in here after each timestamp to
-	// ensures this isn't the case and that the log filtering doesn't filter out
-	// the log entires we're looking for. The value of 20 μs was chosen because
-	// the log timestamps have a fidelity of 10 μs and thus doubling that should
-	// be a sufficient buffer.
-	// See util/log/clog.go formatHeader() for more details.
-	const sleepBuffer = time.Microsecond * 20
-	timestamp := timeutil.Now().UnixNano()
-	time.Sleep(sleepBuffer)
-	log.Errorf(context.Background(), "TestStatusLocalLogFile test message-Error")
-	time.Sleep(sleepBuffer)
-	timestampE := timeutil.Now().UnixNano()
-	time.Sleep(sleepBuffer)
-	log.Warningf(context.Background(), "TestStatusLocalLogFile test message-Warning")
-	time.Sleep(sleepBuffer)
-	timestampEW := timeutil.Now().UnixNano()
-	time.Sleep(sleepBuffer)
-	log.Infof(context.Background(), "TestStatusLocalLogFile test message-Info")
-	time.Sleep(sleepBuffer)
-	timestampEWI := timeutil.Now().UnixNano()
-
-	var wrapper serverpb.LogFilesListResponse
-	if err := getStatusJSONProto(ts, "logfiles/local", &wrapper); err != nil {
-		t.Fatal(err)
-	}
-	if a, e := len(wrapper.Files), 1; a != e {
-		t.Fatalf("expected %d log files; got %d", e, a)
-	}
-
-	// Check each individual log can be fetched and is non-empty.
-	var foundInfo, foundWarning, foundError bool
-	for _, file := range wrapper.Files {
-		var wrapper serverpb.LogEntriesResponse
-		if err := getStatusJSONProto(ts, "logfiles/local/"+file.Name, &wrapper); err != nil {
-			t.Fatal(err)
-		}
-		for _, entry := range wrapper.Entries {
-			switch entry.Message {
-			case "TestStatusLocalLogFile test message-Error":
-				foundError = true
-			case "TestStatusLocalLogFile test message-Warning":
-				foundWarning = true
-			case "TestStatusLocalLogFile test message-Info":
-				foundInfo = true
-			}
-		}
-	}
-
-	if !(foundInfo && foundWarning && foundError) {
-		t.Errorf("expected to find test messages in %v", wrapper.Files)
-	}
-
-	type levelPresence struct {
-		Error, Warning, Info bool
-	}
-
-	testCases := []struct {
-		MaxEntities    int
-		StartTimestamp int64
-		EndTimestamp   int64
-		Pattern        string
-		levelPresence
-	}{
-		// Test filtering by log severity.
-		// // Test entry limit. Ignore Info/Warning/Error filters.
-		{1, timestamp, timestampEWI, "", levelPresence{false, false, false}},
-		{2, timestamp, timestampEWI, "", levelPresence{false, false, false}},
-		{3, timestamp, timestampEWI, "", levelPresence{false, false, false}},
-		// Test filtering in different timestamp windows.
-		{0, timestamp, timestamp, "", levelPresence{false, false, false}},
-		{0, timestamp, timestampE, "", levelPresence{true, false, false}},
-		{0, timestampE, timestampEW, "", levelPresence{false, true, false}},
-		{0, timestampEW, timestampEWI, "", levelPresence{false, false, true}},
-		{0, timestamp, timestampEW, "", levelPresence{true, true, false}},
-		{0, timestampE, timestampEWI, "", levelPresence{false, true, true}},
-		{0, timestamp, timestampEWI, "", levelPresence{true, true, true}},
-		// Test filtering by regexp pattern.
-		{0, 0, 0, "Info", levelPresence{false, false, true}},
-		{0, 0, 0, "Warning", levelPresence{false, true, false}},
-		{0, 0, 0, "Error", levelPresence{true, false, false}},
-		{0, 0, 0, "Info|Error|Warning", levelPresence{true, true, true}},
-		{0, 0, 0, "Nothing", levelPresence{false, false, false}},
-	}
-
-	for i, testCase := range testCases {
-		var url bytes.Buffer
-		fmt.Fprintf(&url, "logs/local?level=")
-		if testCase.MaxEntities > 0 {
-			fmt.Fprintf(&url, "&max=%d", testCase.MaxEntities)
-		}
-		if testCase.StartTimestamp > 0 {
-			fmt.Fprintf(&url, "&start_time=%d", testCase.StartTimestamp)
-		}
-		if testCase.StartTimestamp > 0 {
-			fmt.Fprintf(&url, "&end_time=%d", testCase.EndTimestamp)
-		}
-		if len(testCase.Pattern) > 0 {
-			fmt.Fprintf(&url, "&pattern=%s", testCase.Pattern)
-		}
-
-		var wrapper serverpb.LogEntriesResponse
-		path := url.String()
-		if err := getStatusJSONProto(ts, path, &wrapper); err != nil {
-			t.Fatal(err)
-		}
-
-		if testCase.MaxEntities > 0 {
-			if a, e := len(wrapper.Entries), testCase.MaxEntities; a != e {
-				t.Errorf("%d expected %d entries, got %d: \n%+v", i, e, a, wrapper.Entries)
-			}
-		} else {
-			var actual levelPresence
-			var logsBuf bytes.Buffer
-			for _, entry := range wrapper.Entries {
-				fmt.Fprintln(&logsBuf, entry.Message)
-
-				switch entry.Message {
-				case "TestStatusLocalLogFile test message-Error":
-					actual.Error = true
-				case "TestStatusLocalLogFile test message-Warning":
-					actual.Warning = true
-				case "TestStatusLocalLogFile test message-Info":
-					actual.Info = true
-				}
-			}
-
-			if testCase.levelPresence != actual {
-				t.Errorf("%d: expected %+v at %s, got:\n%s", i, testCase, path, logsBuf.String())
-			}
-		}
-	}
-}
-
-// TestNodeStatusResponse verifies that node status returns the expected
-// results.
-func TestNodeStatusResponse(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	s := startServer(t)
-	defer s.Stopper().Stop(context.TODO())
-
-	// First fetch all the node statuses.
-	wrapper := serverpb.NodesResponse{}
-	if err := getStatusJSONProto(s, "nodes", &wrapper); err != nil {
-		t.Fatal(err)
-	}
-	nodeStatuses := wrapper.Nodes
-
-	if len(nodeStatuses) != 1 {
-		t.Errorf("too many node statuses returned - expected:1 actual:%d", len(nodeStatuses))
-	}
-	if !reflect.DeepEqual(s.node.Descriptor, nodeStatuses[0].Desc) {
-		t.Errorf("node status descriptors are not equal\nexpected:%+v\nactual:%+v\n", s.node.Descriptor, nodeStatuses[0].Desc)
-	}
-
-	// Now fetch each one individually. Loop through the nodeStatuses to use the
-	// ids only.
-	for _, oldNodeStatus := range nodeStatuses {
-		nodeStatus := status.NodeStatus{}
-		if err := getStatusJSONProto(s, "nodes/"+oldNodeStatus.Desc.NodeID.String(), &nodeStatus); err != nil {
-			t.Fatal(err)
-		}
-		if !reflect.DeepEqual(s.node.Descriptor, nodeStatus.Desc) {
-			t.Errorf("node status descriptors are not equal\nexpected:%+v\nactual:%+v\n", s.node.Descriptor, nodeStatus.Desc)
-		}
-	}
-}
-
-// TestMetricsRecording verifies that Node statistics are periodically recorded
-// as time series data.
-func TestMetricsRecording(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	s, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{
-		MetricsSampleInterval: 5 * time.Millisecond})
-	defer s.Stopper().Stop(context.TODO())
-
-	checkTimeSeriesKey := func(now int64, keyName string) error {
-		key := ts.MakeDataKey(keyName, "", ts.Resolution10s, now)
-		data := roachpb.InternalTimeSeriesData{}
-		return kvDB.GetProto(context.TODO(), key, &data)
-	}
-
-	// Verify that metrics for the current timestamp are recorded. This should
-	// be true very quickly.
 	testutils.SucceedsSoon(t, func() error {
-		now := s.Clock().PhysicalNow()
-		if err := checkTimeSeriesKey(now, "cr.store.livebytes.1"); err != nil {
+		ss := s.TenantStatusServer().(serverpb.TenantStatusServer)
+		resp, err := ss.HotRangesV2(ctx, &serverpb.HotRangesRequest{})
+		if err != nil {
 			return err
 		}
-		if err := checkTimeSeriesKey(now, "cr.node.sys.go.allocbytes.1"); err != nil {
-			return err
+
+		if !responseHasTable(resp, "descriptor") {
+			return errors.New("waiting for hot ranges to be collected")
 		}
 		return nil
 	})
 }
 
-// TestMetricsEndpoint retrieves the metrics endpoint, which is currently only
-// used for development purposes. The metrics within the response are verified
-// in other tests.
-func TestMetricsEndpoint(t *testing.T) {
+func TestHotRangesPayloadMultitenant(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := startServer(t)
-	defer s.Stopper().Stop(context.TODO())
+	sc := log.ScopeWithoutShowLogs(t)
+	defer sc.Close(t)
 
-	if _, err := getText(s, s.AdminURL()+statusPrefix+"metrics/"+s.Gossip().NodeID.String()); err != nil {
-		t.Fatal(err)
+	ctx := context.Background()
+
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+		StoreSpecs: []base.StoreSpec{
+			base.DefaultTestStoreSpec,
+			base.DefaultTestStoreSpec,
+			base.DefaultTestStoreSpec,
+		},
+		Knobs: base.TestingKnobs{
+			Store: &kvserver.StoreTestingKnobs{
+				ReplicaPlannerKnobs: plan.ReplicaPlannerTestingKnobs{
+					DisableReplicaRebalancing: true,
+				},
+			},
+		},
+	})
+	defer s.Stopper().Stop(ctx)
+
+	tenantID := roachpb.MustMakeTenantID(2)
+	tt, err := s.TenantController().StartTenant(ctx, base.TestTenantArgs{
+		TenantID: tenantID,
+	})
+	require.NoError(t, err)
+
+	testutils.SucceedsSoon(t, func() error {
+		ss := tt.TenantStatusServer().(serverpb.TenantStatusServer)
+		resp, err := ss.HotRangesV2(ctx, &serverpb.HotRangesRequest{TenantID: tenantID.String()})
+		if err != nil {
+			return err
+		}
+
+		if !responseHasTable(resp, "descriptor") {
+			return errors.New("waiting for hot ranges to be collected")
+		}
+		return nil
+	})
+}
+
+func justIds(ranges []*serverpb.HotRangesResponseV2_HotRange) []int {
+	ids := []int{}
+	for i := range len(ranges) {
+		ids = append(ids, int(ranges[i].RangeID))
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+func assertRangesEqualish(t *testing.T, a, b []*serverpb.HotRangesResponseV2_HotRange) {
+	require.Equal(t, justIds(a), justIds(b))
+}
+
+func assertRangesNotEqualish(t *testing.T, a, b []*serverpb.HotRangesResponseV2_HotRange) {
+	require.NotEqual(t, justIds(a), justIds(b))
+}
+
+func TestHotRangesByNode(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	sc := log.ScopeWithoutShowLogs(t)
+	defer sc.Close(t)
+
+	ctx := context.Background()
+
+	tc := serverutils.StartCluster(t, 3, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
+		ServerArgs:      base.TestServerArgs{},
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	db := tc.ServerConn(0)
+	sqlutils.CreateTable(
+		t, db, "foo",
+		"k INT PRIMARY KEY, v INT",
+		300,
+		sqlutils.ToRowFn(sqlutils.RowIdxFn, sqlutils.RowModuloFn(2)),
+	)
+
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(
+		tc.Server(0).DB(), keys.SystemSQLCodec, "test", "foo")
+	tc.SplitTable(t, tableDesc, []serverutils.SplitPoint{
+		{TargetNodeIdx: 1, Vals: []any{160}},
+		{TargetNodeIdx: 1, Vals: []any{180}},
+	})
+
+	// wait for the new table to show up in the hot ranges response
+	testutils.SucceedsSoon(t, func() error {
+		req := &serverpb.HotRangesRequest{PageSize: 100, Nodes: []string{"2"}}
+		resp, err := tc.ApplicationLayer(0).StatusServer().(*systemStatusServer).HotRangesV2(ctx, req)
+		if err != nil {
+			return err
+		}
+
+		if responseHasTable(resp, "foo") {
+			return nil
+		}
+
+		return errors.New("waiting for foo to show up in response")
+	})
+
+	type call struct {
+		fromNode int
+		nodes    []string
+		nodeid   string
+	}
+
+	for _, test := range []struct {
+		name    string
+		control call
+		compare call
+		equal   bool
+	}{
+		{
+			"both fanout",
+			call{0, []string{}, ""},
+			call{1, []string{}, ""},
+			true,
+		},
+		{
+			"call from different nodes, collect from same node",
+			call{0, []string{"1"}, ""},
+			call{1, []string{"1"}, ""},
+			true,
+		},
+		{
+			"call from same node, collect from different nodes",
+			call{0, []string{"1"}, ""},
+			call{0, []string{"2"}, ""},
+			false,
+		},
+		{
+			"local and explicit node have the same result from different nodes",
+			call{0, []string{"local"}, ""},
+			call{1, []string{"1"}, ""},
+			true,
+		},
+		{
+			"local has different results if coming from different nodes",
+			call{0, []string{"local"}, ""},
+			call{1, []string{"local"}, ""},
+			false,
+		},
+		{
+			"using nodeid and nodes array return same results",
+			call{0, []string{}, "1"},
+			call{0, []string{"1"}, ""},
+			false,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			req := &serverpb.HotRangesRequest{PageSize: 100, Nodes: test.control.nodes}
+			resp1, err := tc.ApplicationLayer(test.control.fromNode).StatusServer().(*systemStatusServer).HotRangesV2(ctx, req)
+			require.NoError(t, err)
+			req.Nodes = test.compare.nodes
+			resp2, err := tc.ApplicationLayer(test.compare.fromNode).StatusServer().(*systemStatusServer).HotRangesV2(ctx, req)
+			require.NoError(t, err)
+
+			if test.equal {
+				assertRangesEqualish(t, resp1.Ranges, resp2.Ranges)
+			} else {
+				assertRangesNotEqualish(t, resp1.Ranges, resp2.Ranges)
+			}
+		})
+	}
+
+	app := tc.ApplicationLayer(0).StatusServer().(*systemStatusServer)
+
+	t.Run("comparing calling one node to multiple", func(t *testing.T) {
+		req := &serverpb.HotRangesRequest{PageSize: 100, Nodes: []string{"1"}}
+		resp1, err := app.HotRangesV2(ctx, req)
+		assert.NoError(t, err)
+		req.Nodes = []string{"2"}
+		resp2, err := app.HotRangesV2(ctx, req)
+		assert.NoError(t, err)
+
+		req.Nodes = []string{"1", "2"}
+		resp1and2, err := app.HotRangesV2(ctx, req)
+		assert.NoError(t, err)
+		combined := append(resp1.Ranges, resp2.Ranges...)
+		assertRangesEqualish(t, resp1and2.Ranges, combined)
+	})
+
+	t.Run("error specifying local and other nodes", func(t *testing.T) {
+		req := &serverpb.HotRangesRequest{PageSize: 100, Nodes: []string{"local", "2"}}
+		_, err := app.HotRangesV2(ctx, req)
+		require.Error(t, err, "cannot call 'local' mixed with other nodes")
+	})
+}
+
+func TestHotRangesStatsOnly(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	sc := log.ScopeWithoutShowLogs(t)
+	defer sc.Close(t)
+
+	ctx := context.Background()
+
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+		StoreSpecs: []base.StoreSpec{
+			base.DefaultTestStoreSpec,
+			base.DefaultTestStoreSpec,
+			base.DefaultTestStoreSpec,
+		},
+		Knobs: base.TestingKnobs{
+			Store: &kvserver.StoreTestingKnobs{
+				ReplicaPlannerKnobs: plan.ReplicaPlannerTestingKnobs{
+					DisableReplicaRebalancing: true,
+				},
+			},
+		},
+	})
+	defer s.Stopper().Stop(ctx)
+
+	for _, test := range []struct {
+		statsOnly      bool
+		hasDescriptors bool
+	}{
+		{true, false},
+		{false, true},
+	} {
+		t.Run(fmt.Sprintf("statsOnly=%t hasDescriptors %t", test.statsOnly, test.hasDescriptors), func(t *testing.T) {
+			testutils.SucceedsSoon(t, func() error {
+				ss := s.StatusServer().(*systemStatusServer)
+				resp, err := ss.HotRangesV2(ctx, &serverpb.HotRangesRequest{NodeID: "local", StatsOnly: test.statsOnly})
+				if err != nil {
+					return err
+				}
+
+				if len(resp.Ranges) == 0 {
+					return errors.New("waiting for hot ranges to be collected")
+				}
+
+				hasDescriptors := false
+				for _, r := range resp.Ranges {
+					allDescriptors := append(r.Databases, append(r.Tables, r.Indexes...)...)
+					if len(allDescriptors) > 0 {
+						hasDescriptors = true
+					}
+				}
+
+				require.Equal(t, test.hasDescriptors, hasDescriptors)
+				return nil
+			})
+		})
 	}
 }
 
-func TestRangesResponse(t *testing.T) {
+func TestHotRangesNodeLimit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer storage.EnableLeaseHistory(100)()
-	ts := startServer(t)
-	defer ts.Stopper().Stop(context.TODO())
+	sc := log.ScopeWithoutShowLogs(t)
+	defer sc.Close(t)
 
-	// Perform a scan to ensure that all the raft groups are initialized.
-	if _, err := ts.db.Scan(context.TODO(), keys.LocalMax, roachpb.KeyMax, 0); err != nil {
-		t.Fatal(err)
-	}
+	ctx := context.Background()
 
-	var response serverpb.RangesResponse
-	if err := getStatusJSONProto(ts, "ranges/local", &response); err != nil {
-		t.Fatal(err)
-	}
-	if len(response.Ranges) == 0 {
-		t.Errorf("didn't get any ranges")
-	}
-	for _, ri := range response.Ranges {
-		// Do some simple validation based on the fact that this is a
-		// single-node cluster.
-		if ri.RaftState.State != "StateLeader" && ri.RaftState.State != "StateDormant" {
-			t.Errorf("expected to be Raft leader or dormant, but was '%s'", ri.RaftState.State)
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+		StoreSpecs: []base.StoreSpec{
+			base.DefaultTestStoreSpec,
+			base.DefaultTestStoreSpec,
+			base.DefaultTestStoreSpec,
+		},
+		Knobs: base.TestingKnobs{
+			Store: &kvserver.StoreTestingKnobs{
+				ReplicaPlannerKnobs: plan.ReplicaPlannerTestingKnobs{
+					DisableReplicaRebalancing: true,
+				},
+			},
+		},
+	})
+	defer s.Stopper().Stop(ctx)
+
+	testutils.SucceedsSoon(t, func() error {
+		ss := s.StatusServer().(*systemStatusServer)
+		resp, err := ss.HotRangesV2(ctx, &serverpb.HotRangesRequest{NodeID: "local", PerNodeLimit: 5})
+		if err != nil {
+			return err
 		}
-		expReplica := roachpb.ReplicaDescriptor{
-			NodeID:    1,
-			StoreID:   1,
-			ReplicaID: 1,
+
+		if len(resp.Ranges) == 0 {
+			return errors.New("waiting for hot ranges to be collected")
 		}
-		if len(ri.State.Desc.Replicas) != 1 || ri.State.Desc.Replicas[0] != expReplica {
-			t.Errorf("unexpected replica list %+v", ri.State.Desc.Replicas)
-		}
-		if ri.State.Lease == nil || *ri.State.Lease == (roachpb.Lease{}) {
-			t.Error("expected a nontrivial Lease")
-		}
-		if ri.State.LastIndex == 0 {
-			t.Error("expected positive LastIndex")
-		}
-		if e, a := 1, len(ri.LeaseHistory); e != a {
-			t.Errorf("expected a lease history length of %d, actual %d\n%+v", e, a, ri)
-		}
-	}
+
+		require.Equal(t, 5, len(resp.Ranges))
+		return nil
+	})
 }
 
-func TestRaftDebug(t *testing.T) {
+// TestLogFileExcludeSeverities verifies that the LogFile RPC filters
+// out entries whose severity is in the ExcludeSeverities set.
+func TestLogFileExcludeSeverities(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := startServer(t)
-	defer s.Stopper().Stop(context.TODO())
-
-	var resp serverpb.RaftDebugResponse
-	if err := getStatusJSONProto(s, "raft", &resp); err != nil {
-		t.Fatal(err)
-	}
-	if len(resp.Ranges) == 0 {
-		t.Errorf("didn't get any ranges")
+	if log.V(3) {
+		skip.IgnoreLint(t, "Test only works with low verbosity levels")
 	}
 
-	if len(resp.Ranges) < 3 {
-		t.Errorf("expected more than 2 ranges, got %d", len(resp.Ranges))
-	}
+	sc := log.ScopeWithoutShowLogs(t)
+	defer sc.Close(t)
+	defer sc.SetupSingleFileLogging()()
 
-	reqURI := "raft"
-	requestedIDs := []roachpb.RangeID{}
-	for id := range resp.Ranges {
-		if len(requestedIDs) == 0 {
-			reqURI += "?"
-		} else {
-			reqURI += "&"
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+	})
+	defer srv.Stopper().Stop(context.Background())
+
+	logCtx := srv.ApplicationLayer().AnnotateCtx(context.Background())
+
+	// Write log entries at different severities.
+	log.Dev.Errorf(logCtx, "sev-filter-test error msg")
+	log.Dev.Warningf(logCtx, "sev-filter-test warning msg")
+	log.Dev.Infof(logCtx, "sev-filter-test info msg")
+	log.FlushAllSync()
+
+	// Find the log file.
+	files, err := log.ListLogFiles()
+	require.NoError(t, err)
+	require.Len(t, files, 1)
+	fileName := files[0].Name
+
+	ss := srv.StatusServer().(*systemStatusServer)
+	ctx := context.Background()
+
+	// Exclude INFO entries.
+	resp, err := ss.LogFile(ctx, &serverpb.LogFileRequest{
+		NodeId:            "local",
+		File:              fileName,
+		ExcludeSeverities: []logpb.Severity{logpb.Severity_INFO},
+	})
+	require.NoError(t, err)
+
+	for _, entry := range resp.Entries {
+		if entry.Severity == logpb.Severity_INFO &&
+			strings.Contains(entry.Message, "sev-filter-test") {
+			t.Errorf("INFO entry should have been filtered out: %s",
+				entry.Message)
 		}
-		reqURI += fmt.Sprintf("range_ids=%d", id)
-		requestedIDs = append(requestedIDs, id)
-		if len(requestedIDs) >= 2 {
-			break
+	}
+	var foundError, foundWarning bool
+	for _, entry := range resp.Entries {
+		msg := strings.TrimSpace(entry.Message)
+		switch {
+		case msg == "sev-filter-test error msg":
+			foundError = true
+		case msg == "sev-filter-test warning msg":
+			foundWarning = true
 		}
 	}
+	require.True(t, foundError, "ERROR entry should be present")
+	require.True(t, foundWarning, "WARNING entry should be present")
 
-	if err := getStatusJSONProto(s, reqURI, &resp); err != nil {
-		t.Fatal(err)
-	}
-
-	// Make sure we get exactly two ranges back.
-	if len(resp.Ranges) != 2 {
-		t.Errorf("expected exactly two ranges in response, got %d", len(resp.Ranges))
-	}
-
-	// Make sure the ranges returned are those requested.
-	for _, reqID := range requestedIDs {
-		if _, ok := resp.Ranges[reqID]; !ok {
-			t.Errorf("request URI was %s, but range ID %d not returned: %+v", reqURI, reqID, resp.Ranges)
+	// Exclude both ERROR and WARNING.
+	resp, err = ss.LogFile(ctx, &serverpb.LogFileRequest{
+		NodeId: "local",
+		File:   fileName,
+		ExcludeSeverities: []logpb.Severity{
+			logpb.Severity_ERROR, logpb.Severity_WARNING,
+		},
+	})
+	require.NoError(t, err)
+	for _, entry := range resp.Entries {
+		if !strings.Contains(entry.Message, "sev-filter-test") {
+			continue
+		}
+		if entry.Severity == logpb.Severity_ERROR ||
+			entry.Severity == logpb.Severity_WARNING {
+			t.Errorf(
+				"entry with severity %s should have been filtered: %s",
+				entry.Severity, entry.Message,
+			)
 		}
 	}
-}
-
-// TestStatusVars verifies that prometheus metrics are available via the
-// /_status/vars endpoint.
-func TestStatusVars(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
-
-	if body, err := getText(s, s.AdminURL()+statusPrefix+"vars"); err != nil {
-		t.Fatal(err)
-	} else if !bytes.Contains(body, []byte("# TYPE sql_bytesout counter\nsql_bytesout")) {
-		t.Errorf("expected sql_bytesout, got: %s", body)
+	var foundInfo bool
+	for _, entry := range resp.Entries {
+		if strings.TrimSpace(entry.Message) == "sev-filter-test info msg" {
+			foundInfo = true
+		}
 	}
-}
+	require.True(t, foundInfo, "INFO entry should be present")
 
-func TestSpanStatsResponse(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	ts := startServer(t)
-	defer ts.Stopper().Stop(context.TODO())
-
-	httpClient, err := ts.GetHTTPClient()
-	if err != nil {
-		t.Fatal(err)
+	// Empty ExcludeSeverities returns everything (default behavior).
+	resp, err = ss.LogFile(ctx, &serverpb.LogFileRequest{
+		NodeId: "local",
+		File:   fileName,
+	})
+	require.NoError(t, err)
+	foundError, foundWarning, foundInfo = false, false, false
+	for _, entry := range resp.Entries {
+		msg := strings.TrimSpace(entry.Message)
+		switch {
+		case msg == "sev-filter-test error msg":
+			foundError = true
+		case msg == "sev-filter-test warning msg":
+			foundWarning = true
+		case msg == "sev-filter-test info msg":
+			foundInfo = true
+		}
 	}
-
-	var response serverpb.SpanStatsResponse
-	request := serverpb.SpanStatsRequest{
-		NodeID:   "1",
-		StartKey: []byte(roachpb.RKeyMin),
-		EndKey:   []byte(roachpb.RKeyMax),
-	}
-
-	url := ts.AdminURL() + statusPrefix + "span"
-	if err := httputil.PostJSON(httpClient, url, &request, &response); err != nil {
-		t.Fatal(err)
-	}
-	initialRanges, err := ts.ExpectedInitialRangeCount()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if a, e := int(response.RangeCount), initialRanges; a != e {
-		t.Errorf("expected %d ranges, found %d", e, a)
-	}
-}
-
-func TestSpanStatsGRPCResponse(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	ts := startServer(t)
-	defer ts.Stopper().Stop(context.TODO())
-
-	rpcStopper := stop.NewStopper()
-	defer rpcStopper.Stop(context.TODO())
-	rpcContext := rpc.NewContext(log.AmbientContext{}, ts.RPCContext().Config, ts.Clock(), rpcStopper)
-	request := serverpb.SpanStatsRequest{
-		NodeID:   "1",
-		StartKey: []byte(roachpb.RKeyMin),
-		EndKey:   []byte(roachpb.RKeyMax),
-	}
-
-	url := ts.ServingAddr()
-	conn, err := rpcContext.GRPCDial(url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client := serverpb.NewStatusClient(conn)
-
-	response, err := client.SpanStats(context.Background(), &request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	initialRanges, err := ts.ExpectedInitialRangeCount()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if a, e := int(response.RangeCount), initialRanges; a != e {
-		t.Errorf("expected %d ranges, found %d", e, a)
-	}
-}
-
-func TestNodesGRPCResponse(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	ts := startServer(t)
-	defer ts.Stopper().Stop(context.TODO())
-
-	rootConfig := testutils.NewTestBaseContext(security.RootUser)
-	rpcContext := rpc.NewContext(log.AmbientContext{}, rootConfig, ts.Clock(), ts.Stopper())
-	var request serverpb.NodesRequest
-
-	url := ts.ServingAddr()
-	conn, err := rpcContext.GRPCDial(url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client := serverpb.NewStatusClient(conn)
-
-	response, err := client.Nodes(context.Background(), &request)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if a, e := len(response.Nodes), 1; a != e {
-		t.Errorf("expected %d node(s), found %d", e, a)
-	}
-}
-
-func TestHandleDebugRange(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	s := startServer(t)
-	defer s.Stopper().Stop(context.TODO())
-
-	if body, err := getText(s, s.AdminURL()+rangeDebugEndpoint+"?id=1"); err != nil {
-		t.Fatal(err)
-	} else if !bytes.Contains(body, []byte("<TITLE>Range ID:1</TITLE>")) {
-		t.Errorf("expected \"<title>Range Id: 1</title>\" got: \n%s", body)
-	}
-}
-
-func TestCertificatesResponse(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	ts := startServer(t)
-	defer ts.Stopper().Stop(context.TODO())
-
-	var response serverpb.CertificatesResponse
-	if err := getStatusJSONProto(ts, "certificates/local", &response); err != nil {
-		t.Fatal(err)
-	}
-
-	// We expect two certificates: CA and node.
-	if a, e := len(response.Certificates), 2; a != e {
-		t.Errorf("expected %d certificates, found %d", e, a)
-	}
-
-	// Read the certificates from the embedded assets.
-	caPath := filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCACert)
-	nodePath := filepath.Join(security.EmbeddedCertsDir, security.EmbeddedNodeCert)
-
-	caFile, err := securitytest.EmbeddedAssets.ReadFile(caPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	nodeFile, err := securitytest.EmbeddedAssets.ReadFile(nodePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// The response is ordered: CA cert followed by node cert.
-	cert := response.Certificates[0]
-	if a, e := cert.Type, serverpb.CertificateDetails_CA; a != e {
-		t.Errorf("wrong type %s, expected %s", a, e)
-	} else if cert.ErrorMessage != "" {
-		t.Errorf("expected cert without error, got %v", cert.ErrorMessage)
-	} else if a, e := cert.Data, caFile; !bytes.Equal(a, e) {
-		t.Errorf("mismatched contents: %s vs %s", a, e)
-	}
-
-	cert = response.Certificates[1]
-	if a, e := cert.Type, serverpb.CertificateDetails_NODE; a != e {
-		t.Errorf("wrong type %s, expected %s", a, e)
-	} else if cert.ErrorMessage != "" {
-		t.Errorf("expected cert without error, got %v", cert.ErrorMessage)
-	} else if a, e := cert.Data, nodeFile; !bytes.Equal(a, e) {
-		t.Errorf("mismatched contents: %s vs %s", a, e)
-	}
-
+	require.True(t, foundError, "ERROR entry should be present")
+	require.True(t, foundWarning, "WARNING entry should be present")
+	require.True(t, foundInfo, "INFO entry should be present")
 }

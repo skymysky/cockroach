@@ -1,34 +1,25 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
-// Author: Andrei Matei (andreimatei1@gmail.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
+	"context"
 	"testing"
 
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
-	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
@@ -36,110 +27,74 @@ import (
 // a rename operation.
 func TestRenameTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer log.Scope(t).Close(t)
+	srv, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
 
-	counter := int64(keys.MaxReservedDescID)
-
-	counter++
-	oldDBID := sqlbase.ID(counter)
 	if _, err := db.Exec(`CREATE DATABASE test`); err != nil {
 		t.Fatal(err)
 	}
 
+	oldDBID := descpb.ID(sqlutils.QueryDatabaseID(t, db, "test"))
+
 	// Create table in 'test'.
-	counter++
 	oldName := "foo"
 	if _, err := db.Exec(`CREATE TABLE test.foo (k INT PRIMARY KEY, v int)`); err != nil {
 		t.Fatal(err)
 	}
 
 	// Check the table descriptor.
-	desc := &sqlbase.Descriptor{}
-	tableDescKey := sqlbase.MakeDescMetadataKey(sqlbase.ID(counter))
-	if err := kvDB.GetProto(context.TODO(), tableDescKey, desc); err != nil {
-		t.Fatal(err)
-	}
-	tableDesc := desc.GetTable()
-	if tableDesc.Name != oldName {
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, s.Codec(), "test", "foo")
+	if tableDesc.GetName() != oldName {
 		t.Fatalf("Wrong table name, expected %s, got: %+v", oldName, tableDesc)
 	}
-	if tableDesc.ParentID != oldDBID {
+	if tableDesc.GetParentID() != oldDBID {
 		t.Fatalf("Wrong parent ID on table, expected %d, got: %+v", oldDBID, tableDesc)
 	}
 
-	// Create database test2.
-	counter++
-	newDBID := sqlbase.ID(counter)
-	if _, err := db.Exec(`CREATE DATABASE test2`); err != nil {
-		t.Fatal(err)
-	}
-
-	// Move table to test2 and change its name as well.
 	newName := "bar"
-	if _, err := db.Exec(`ALTER TABLE test.foo RENAME TO test2.bar`); err != nil {
+	if _, err := db.Exec(`ALTER TABLE test.foo RENAME TO test.bar`); err != nil {
 		t.Fatal(err)
 	}
 
 	// Check the table descriptor again.
-	if err := kvDB.GetProto(context.TODO(), tableDescKey, desc); err != nil {
-		t.Fatal(err)
-	}
-	tableDesc = desc.GetTable()
-	if tableDesc.Name != newName {
+	renamedDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, s.Codec(), "test", "bar")
+	if renamedDesc.GetName() != newName {
 		t.Fatalf("Wrong table name, expected %s, got: %+v", newName, tableDesc)
 	}
-	if tableDesc.ParentID != newDBID {
-		t.Fatalf("Wrong parent ID on table, expected %d, got: %+v", newDBID, tableDesc)
+	if renamedDesc.GetParentID() != oldDBID {
+		t.Fatalf("Wrong parent ID on table, expected %d, got: %+v", oldDBID, tableDesc)
 	}
-}
-
-// isRenamed tests if a descriptor is updated by gossip to the specified name
-// and version.
-func isRenamed(
-	tableID sqlbase.ID,
-	expectedName string,
-	expectedVersion sqlbase.DescriptorVersion,
-	cfg config.SystemConfig,
-) bool {
-	descKey := sqlbase.MakeDescMetadataKey(tableID)
-	val := cfg.GetValue(descKey)
-	if val == nil {
-		return false
+	if renamedDesc.GetID() != tableDesc.GetID() {
+		t.Fatalf("Wrong ID after rename, got %d, expected %d",
+			renamedDesc.GetID(), tableDesc.GetID())
 	}
-	var descriptor sqlbase.Descriptor
-	if err := val.GetProto(&descriptor); err != nil {
-		panic("unable to unmarshal table descriptor")
-	}
-	table := descriptor.GetTable()
-	return table.Name == expectedName && table.Version == expectedVersion
 }
 
 // Test that a SQL txn that resolved a name can keep resolving that name during
 // its lifetime even after the table has been renamed.
-// Also tests that the name of a renamed table cannot be reused until everybody
-// has stopped using it. Otherwise, we'd have different transactions in the
-// systems using a single name for different tables.
 // Also tests that the old name cannot be used by node that doesn't have a lease
 // on the old version even while the name mapping still exists.
 func TestTxnCanStillResolveOldName(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	var lmKnobs LeaseManagerTestingKnobs
+	var lmKnobs lease.ManagerTestingKnobs
 	// renameUnblocked is used to block the rename schema change until the test
 	// doesn't need the old name->id mapping to exist anymore.
 	renameUnblocked := make(chan interface{})
 	serverParams := base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			SQLSchemaChanger: &SchemaChangerTestingKnobs{
-				RenameOldNameNotInUseNotification: func() {
+				OldNamesDrainedNotification: func() {
 					<-renameUnblocked
 				},
 			},
 			SQLLeaseManager: &lmKnobs,
 		}}
 	var mu syncutil.Mutex
-	var waitTableID sqlbase.ID
+	var waitTableID descpb.ID
 	// renamed is used to block until the node cannot get leases with the original
 	// table name. It will be signaled once the table has been renamed and the update
 	// about the new name has been processed. Moreover, not only does an update to
@@ -148,19 +103,25 @@ func TestTxnCanStillResolveOldName(t *testing.T) {
 	// leases using the old name (an update with the new name but the original
 	// version is ignored by the leasing refresh mechanism).
 	renamed := make(chan interface{})
-	lmKnobs.TestingLeasesRefreshedEvent =
-		func(cfg config.SystemConfig) {
+	lmKnobs.TestingDescriptorRefreshedEvent =
+		func(descriptor *descpb.Descriptor) {
 			mu.Lock()
 			defer mu.Unlock()
-			if waitTableID != 0 {
-				if isRenamed(waitTableID, "t2", 2, cfg) {
-					close(renamed)
-					waitTableID = 0
-				}
+			id, version, name, _, err := descpb.GetDescriptorMetadata(descriptor)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if waitTableID != id {
+				return
+			}
+			if name == "t2" && version == 2 {
+				close(renamed)
+				waitTableID = 0
 			}
 		}
-	s, db, kvDB := serverutils.StartServer(t, serverParams)
-	defer s.Stopper().Stop(context.TODO())
+	srv, db, kvDB := serverutils.StartServer(t, serverParams)
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
 
 	sql := `
 CREATE DATABASE test;
@@ -171,9 +132,9 @@ CREATE TABLE test.t (a INT PRIMARY KEY);
 		t.Fatal(err)
 	}
 
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "test", "t")
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, s.Codec(), "test", "t")
 	mu.Lock()
-	waitTableID = tableDesc.ID
+	waitTableID = tableDesc.GetID()
 	mu.Unlock()
 
 	txn, err := db.Begin()
@@ -187,32 +148,29 @@ CREATE TABLE test.t (a INT PRIMARY KEY);
 	}
 
 	// Concurrently, rename the table.
-	threadDone := make(chan interface{})
+	threadDone := make(chan error)
 	go func() {
 		// The ALTER will commit and signal the main thread through `renamed`, but
 		// the schema changer will remain blocked by the lease on the "t" version
 		// held by the txn started above.
-		if _, err := db.Exec("ALTER TABLE test.t RENAME TO test.t2"); err != nil {
-			panic(err)
+		_, err := db.Exec("ALTER TABLE test.t RENAME TO test.t2")
+		threadDone <- err
+	}()
+	defer func() {
+		close(renameUnblocked)
+		// Block until the thread doing the rename has finished, so the test can clean
+		// up. It needed to wait for the transaction to release its lease.
+		if err := <-threadDone; err != nil {
+			t.Fatal(err)
 		}
-		close(threadDone)
 	}()
 
-	// Block until the LeaseManager has processed the gossip update.
+	// Block until the Manager has processed the gossip update.
 	<-renamed
 
 	// Run another command in the transaction and make sure that we can still
 	// resolve the table name.
 	if _, err := txn.Exec("SELECT * FROM test.t"); err != nil {
-		t.Fatal(err)
-	}
-
-	// Check that the name cannot be reused while somebody still has a lease on
-	// the old one (the mechanism for ensuring this is that the entry for the old
-	// name is not deleted from the database until the async schema changer checks
-	// that there's no more leases on the old version).
-	if _, err := db.Exec("CREATE TABLE test.t (a INT PRIMARY KEY)"); !testutils.IsError(
-		err, `relation "t" already exists`) {
 		t.Fatal(err)
 	}
 
@@ -223,20 +181,24 @@ CREATE TABLE test.t (a INT PRIMARY KEY);
 	// Check that the old name is not usable outside of the transaction now
 	// that the node doesn't have a lease on it anymore (committing the txn
 	// should have released the lease on the version of the descriptor with the
-	// old name), even thoudh the name mapping still exists.
-	lease := s.LeaseManager().(*LeaseManager).tableNames.get(tableDesc.ID, "t", s.Clock())
-	if lease != nil {
+	// old name), even though the name mapping still exists.
+
+	var foundLease bool
+	s.LeaseManager().(*lease.Manager).VisitLeases(func(
+		desc catalog.Descriptor, dropped bool, refCount int, expiration tree.DTimestamp,
+	) (wantMore bool) {
+		if desc.GetID() == tableDesc.GetID() && desc.GetName() == "t" {
+			foundLease = true
+		}
+		return true
+	})
+	if foundLease {
 		t.Fatalf(`still have lease on "t"`)
 	}
 	if _, err := db.Exec("SELECT * FROM test.t"); !testutils.IsError(
-		err, `table "test.t" does not exist`) {
+		err, `relation "test.t" does not exist`) {
 		t.Fatal(err)
 	}
-	close(renameUnblocked)
-
-	// Block until the thread doing the rename has finished, so the test can clean
-	// up. It needed to wait for the transaction to release its lease.
-	<-threadDone
 }
 
 // Test that a txn doing a rename can use the new name immediately.
@@ -244,10 +206,12 @@ CREATE TABLE test.t (a INT PRIMARY KEY);
 // better or worse.
 func TestTxnCanUseNewNameAfterRename(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	sql := `
+SET autocommit_before_ddl=off;
 CREATE DATABASE test;
 CREATE TABLE test.t (a INT PRIMARY KEY);
 `
@@ -256,28 +220,45 @@ CREATE TABLE test.t (a INT PRIMARY KEY);
 		t.Fatal(err)
 	}
 
-	txn, err := db.Begin()
-	if err != nil {
+	// Make sure we take a lease on the version called "t".
+	if _, err := db.Exec("SELECT * FROM test.t"); err != nil {
 		t.Fatal(err)
+	}
+	{
+		txn, err := db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := txn.Exec("ALTER TABLE test.t RENAME TO test.t2"); err != nil {
+			t.Fatal(err)
+		}
+		// Check that we can use the new name.
+		if _, err := txn.Exec("SELECT * FROM test.t2"); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := txn.Commit(); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	// Make sure we take a lease on the version called "t".
-	if _, err := txn.Exec("SELECT * FROM test.t"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := txn.Exec("ALTER TABLE test.t RENAME TO test.t2"); err != nil {
-		t.Fatal(err)
-	}
-	// Check that we can use the new name.
-	if _, err := txn.Exec("SELECT * FROM test.t2"); err != nil {
-		t.Fatal(err)
-	}
-	// Check that we can also use the old name, since we have a lease on it.
-	if _, err := txn.Exec("SELECT * FROM test.t"); err != nil {
-		t.Fatal(err)
-	}
-	if err := txn.Commit(); err != nil {
-		t.Fatal(err)
+	{
+		txn, err := db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := txn.Exec("ALTER TABLE test.t2 RENAME TO test.t"); err != nil {
+			t.Fatal(err)
+		}
+		// Check that we can use the new name.
+		if _, err := txn.Exec("SELECT * FROM test.t"); err != nil {
+			t.Fatal(err)
+		}
+		if err := txn.Rollback(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -285,8 +266,9 @@ CREATE TABLE test.t (a INT PRIMARY KEY);
 // series of renames in a transaction.
 func TestSeriesOfRenames(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	sql := `
 CREATE DATABASE test;
@@ -299,6 +281,9 @@ CREATE TABLE test.t (a INT PRIMARY KEY);
 
 	txn, err := db.Begin()
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := txn.Exec("SET LOCAL autocommit_before_ddl = false"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := txn.Exec("ALTER TABLE test.t RENAME TO test.t2"); err != nil {

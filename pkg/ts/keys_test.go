@@ -1,18 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt.r.tracy@gmail.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ts
 
@@ -41,7 +30,7 @@ func TestDataKeys(t *testing.T) {
 			0,
 			Resolution10s,
 			30,
-			"/System/tsd/test.metric/testsource/10s/1970-01-01T00:00:00Z",
+			"/System/tsd/test.metric/10s/1970-01-01T00:00:00Z/testsource",
 		},
 		{
 			"test.no.source",
@@ -49,7 +38,7 @@ func TestDataKeys(t *testing.T) {
 			1429114700000000000,
 			Resolution10s,
 			26,
-			"/System/tsd/test.no.source//10s/2015-04-15T16:00:00Z",
+			"/System/tsd/test.no.source/10s/2015-04-15T16:00:00Z/",
 		},
 		{
 			"",
@@ -57,7 +46,39 @@ func TestDataKeys(t *testing.T) {
 			-1429114700000000000,
 			Resolution10s,
 			12,
-			"/System/tsd///10s/1924-09-18T08:00:00Z",
+			"/System/tsd//10s/1924-09-18T08:00:00Z/",
+		},
+		{
+			"test.metric",
+			"testsource",
+			0,
+			Resolution1m,
+			30,
+			"/System/tsd/test.metric/1m/1970-01-01T00:00:00Z/testsource",
+		},
+		{
+			"test.no.source",
+			"",
+			1429114700000000000,
+			Resolution1m,
+			26,
+			"/System/tsd/test.no.source/1m/2015-04-15T16:00:00Z/",
+		},
+		{
+			"",
+			"",
+			-1429114700000000000,
+			Resolution1m,
+			12,
+			"/System/tsd//1m/1924-09-18T08:00:00Z/",
+		},
+		{
+			"metric.with:special/chars{label=\"@@ αβ_ !星\",}",
+			"source:with/special-chars",
+			0,
+			Resolution10s,
+			83,
+			"/System/tsd/metric.with:special/chars{label=\"@@ αβ_ !星\",}/10s/1970-01-01T00:00:00Z/source:with/special-chars",
 		},
 	}
 
@@ -84,7 +105,7 @@ func TestDataKeys(t *testing.T) {
 		if !reflect.DeepEqual(d, tc) {
 			t.Errorf("%d: decoded values %v did not match expected %v", i, d, tc)
 		}
-		if pretty := keys.PrettyPrint(encoded); tc.expectedPretty != pretty {
+		if pretty := keys.PrettyPrint(nil /* valDirs */, encoded); tc.expectedPretty != pretty {
 			t.Errorf("%d: expected %s, but got %s", i, tc.expectedPretty, pretty)
 		}
 	}

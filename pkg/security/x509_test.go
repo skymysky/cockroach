@@ -1,18 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package security_test
 
@@ -23,7 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -43,7 +34,7 @@ func timesFuzzyEqual(a, b time.Time) bool {
 func TestGenerateCertLifetime(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	testKey, err := rsa.GenerateKey(rand.Reader, 512)
+	testKey, err := rsa.GenerateKey(rand.Reader, 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,14 +58,16 @@ func TestGenerateCertLifetime(t *testing.T) {
 
 	// Create a Node certificate expiring in 4 days. Fails on shorter CA lifetime.
 	nodeDuration := time.Hour * 96
-	_, err = security.GenerateServerCert(caCert, testKey, testKey.Public(), nodeDuration, []string{"localhost"})
+	_, err = security.GenerateServerCert(caCert, testKey,
+		testKey.Public(), nodeDuration, username.NodeUserName(), []string{"localhost"})
 	if !testutils.IsError(err, "CA lifetime is .*, shorter than the requested .*") {
 		t.Fatal(err)
 	}
 
 	// Try again, but expiring before the CA cert.
 	nodeDuration = time.Hour * 24
-	nodeBytes, err := security.GenerateServerCert(caCert, testKey, testKey.Public(), nodeDuration, []string{"localhost"})
+	nodeBytes, err := security.GenerateServerCert(caCert, testKey,
+		testKey.Public(), nodeDuration, username.NodeUserName(), []string{"localhost"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,14 +83,16 @@ func TestGenerateCertLifetime(t *testing.T) {
 
 	// Create a Client certificate expiring in 4 days. Should get reduced to the CA lifetime.
 	clientDuration := time.Hour * 96
-	_, err = security.GenerateClientCert(caCert, testKey, testKey.Public(), clientDuration, "testuser")
+	_, err = security.GenerateClientCert(caCert, testKey, testKey.Public(), clientDuration, username.TestUserName(),
+		[]roachpb.TenantID{roachpb.SystemTenantID}, nil)
 	if !testutils.IsError(err, "CA lifetime is .*, shorter than the requested .*") {
 		t.Fatal(err)
 	}
 
 	// Try again, but expiring before the CA cert.
 	clientDuration = time.Hour * 24
-	clientBytes, err := security.GenerateClientCert(caCert, testKey, testKey.Public(), clientDuration, "testuser")
+	clientBytes, err := security.GenerateClientCert(caCert, testKey, testKey.Public(), clientDuration,
+		username.TestUserName(), []roachpb.TenantID{roachpb.SystemTenantID}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,5 +105,4 @@ func TestGenerateCertLifetime(t *testing.T) {
 	if a, e := clientCert.NotAfter, now.Add(clientDuration); !timesFuzzyEqual(a, e) {
 		t.Fatalf("client expiration differs from requested: %s vs %s", a, e)
 	}
-
 }

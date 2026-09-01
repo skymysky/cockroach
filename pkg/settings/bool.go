@@ -1,21 +1,15 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package settings
 
 import (
-	"sync/atomic"
+	"context"
+	"strconv"
+
+	"github.com/cockroachdb/errors"
 )
 
 // BoolSetting is the interface of a setting variable that will be
@@ -23,19 +17,48 @@ import (
 // of type "bool" is updated.
 type BoolSetting struct {
 	common
-	v            int32
 	defaultValue bool
+	validateFn   func(*Values, bool) error
 }
 
-var _ Setting = &BoolSetting{}
+var _ internalSetting = &BoolSetting{}
 
 // Get retrieves the bool value in the setting.
-func (b *BoolSetting) Get() bool {
-	return atomic.LoadInt32(&b.v) != 0
+func (b *BoolSetting) Get(sv *Values) bool {
+	return sv.getInt64(b.slot) != 0
 }
 
-func (b *BoolSetting) String() string {
-	return EncodeBool(b.Get())
+func (b *BoolSetting) String(sv *Values) string {
+	return EncodeBool(b.Get(sv))
+}
+
+// DefaultString returns the default value for the setting as a string.
+func (b *BoolSetting) DefaultString() string {
+	return EncodeBool(b.defaultValue)
+}
+
+// Encoded returns the encoded value of the current value of the setting.
+func (b *BoolSetting) Encoded(sv *Values) string {
+	return b.String(sv)
+}
+
+// EncodedDefault returns the encoded value of the default value of the setting.
+func (b *BoolSetting) EncodedDefault() string {
+	return EncodeBool(b.defaultValue)
+}
+
+// DecodeToString decodes and renders an encoded value.
+func (b *BoolSetting) DecodeToString(encoded string) (string, error) {
+	bv, err := b.DecodeValue(encoded)
+	if err != nil {
+		return "", err
+	}
+	return EncodeBool(bv), nil
+}
+
+// DecodeValue decodes the value into a float.
+func (b *BoolSetting) DecodeValue(encoded string) (bool, error) {
+	return strconv.ParseBool(encoded)
 }
 
 // Typ returns the short (1 char) string denoting the type of setting.
@@ -43,48 +66,95 @@ func (*BoolSetting) Typ() string {
 	return "b"
 }
 
-func (b *BoolSetting) set(v bool) {
-	vInt := int32(0)
+// Default returns default value for setting.
+func (b *BoolSetting) Default() bool {
+	return b.defaultValue
+}
+
+// Defeat the linter.
+var _ = (*BoolSetting).Default
+
+// Override changes the setting without validation and also overrides the
+// default value.
+//
+// For testing usage only.
+func (b *BoolSetting) Override(ctx context.Context, sv *Values, v bool) {
+	sv.setValueOrigin(ctx, b.slot, OriginOverride)
+	b.set(ctx, sv, v)
+	sv.setDefaultOverride(b.slot, v)
+}
+
+// Validate that a value conforms with the validation function.
+func (b *BoolSetting) Validate(sv *Values, v bool) error {
+	if b.validateFn != nil {
+		if err := b.validateFn(sv, v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *BoolSetting) set(ctx context.Context, sv *Values, v bool) {
+	vInt := int64(0)
 	if v {
 		vInt = 1
 	}
-	if atomic.SwapInt32(&b.v, vInt) != vInt {
-		b.changed()
-	}
+	sv.setInt64(ctx, b.slot, vInt)
 }
 
-func (b *BoolSetting) setToDefault() {
-	b.set(b.defaultValue)
+func (b *BoolSetting) decodeAndSet(ctx context.Context, sv *Values, encoded string) error {
+	v, err := strconv.ParseBool(encoded)
+	if err := b.Validate(sv, v); err != nil {
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	b.set(ctx, sv, v)
+	return nil
+}
+
+func (b *BoolSetting) decodeAndSetDefaultOverride(
+	ctx context.Context, sv *Values, encoded string,
+) error {
+	v, err := strconv.ParseBool(encoded)
+	if err != nil {
+		return err
+	}
+	sv.setDefaultOverride(b.slot, v)
+	return nil
+}
+
+func (b *BoolSetting) setToDefault(ctx context.Context, sv *Values) {
+	// See if the default value was overridden.
+	if val := sv.getDefaultOverride(b.slot); val != nil {
+		b.set(ctx, sv, val.(bool))
+		return
+	}
+	b.set(ctx, sv, b.defaultValue)
 }
 
 // RegisterBoolSetting defines a new setting with type bool.
-func RegisterBoolSetting(key, desc string, defaultValue bool) *BoolSetting {
-	setting := &BoolSetting{defaultValue: defaultValue}
-	register(key, desc, setting)
+func RegisterBoolSetting(
+	class Class, key InternalKey, desc string, defaultValue bool, opts ...SettingOption,
+) *BoolSetting {
+	validateFn := func(sv *Values, val bool) error {
+		for _, opt := range opts {
+			switch {
+			case opt.commonOpt != nil:
+				continue
+			case opt.validateBoolFn != nil:
+			default:
+				panic(errors.AssertionFailedf("wrong validator type"))
+			}
+			if err := opt.validateBoolFn(sv, val); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	setting := &BoolSetting{defaultValue: defaultValue, validateFn: validateFn}
+	register(class, key, desc, setting)
+	setting.apply(opts)
 	return setting
-}
-
-// TestingSetBool returns a mock, unregistered bool setting for testing. It
-// takes a pointer to a BoolSetting reference, swapping in the mock setting.
-// It returns a cleanup function that swaps back the original setting. This
-// function should not be used by tests that run in parallel, as it could
-// result in race detector failures, as well as if the cleanup functions are
-// called out of order. The original Setting remains registered for
-// gossip-driven updates which become visible when it is restored.
-func TestingSetBool(s **BoolSetting, v bool) func() {
-	saved := *s
-	if v {
-		*s = &BoolSetting{v: 1}
-	} else {
-		*s = &BoolSetting{v: 0}
-	}
-	return func() {
-		*s = saved
-	}
-}
-
-// OnChange registers a callback to be called when the setting changes.
-func (b *BoolSetting) OnChange(fn func()) *BoolSetting {
-	b.setOnChange(fn)
-	return b
 }

@@ -1,35 +1,27 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package security
 
 import (
+	"context"
 	"crypto/x509"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
-	"golang.org/x/net/context"
-
+	"github.com/cockroachdb/cockroach/pkg/security/certnames"
+	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/errors/oserror"
 )
 
 func init() {
@@ -45,61 +37,66 @@ func init() {
 
 var skipPermissionChecks bool
 
-// AssetLoader describes the functions necessary to read certificate and key files.
-type AssetLoader struct {
-	ReadDir  func(dirname string) ([]os.FileInfo, error)
-	ReadFile func(filename string) ([]byte, error)
-	Stat     func(name string) (os.FileInfo, error)
-}
-
-// defaultAssetLoader uses real filesystem calls.
-var defaultAssetLoader = AssetLoader{
-	ReadDir:  ioutil.ReadDir,
-	ReadFile: ioutil.ReadFile,
-	Stat:     os.Stat,
-}
-
-// assetLoaderImpl is used to list/read/stat security assets.
-var assetLoaderImpl = defaultAssetLoader
-
-// SetAssetLoader overrides the asset loader with the passed-in one.
-func SetAssetLoader(al AssetLoader) {
-	assetLoaderImpl = al
-}
-
-// ResetAssetLoader restores the asset loader to the default value.
-func ResetAssetLoader() {
-	assetLoaderImpl = defaultAssetLoader
-}
-
-type pemUsage uint32
+// PemUsage indicates the purpose of a given certificate.
+type PemUsage uint32
 
 const (
-	_ pemUsage = iota
-	// CAPem describes a CA certificate.
+	_ PemUsage = iota
+	// CAPem describes the main CA certificate.
 	CAPem
-	// NodePem describes a combined server/client certificate for user Node.
+	// TenantCAPem describes the CA certificate used to broker authN/Z for SQL
+	// tenants wishing to access the KV layer.
+	TenantCAPem
+	// ClientCAPem describes the CA certificate used to verify client certificates.
+	ClientCAPem
+	// UICAPem describes the CA certificate used to verify the Admin UI server certificate.
+	UICAPem
+	// NodePem describes the server certificate for the node, possibly a combined server/client
+	// certificate for user Node if a separate 'client.node.crt' is not present.
 	NodePem
+	// UIPem describes the server certificate for the admin UI.
+	UIPem
 	// ClientPem describes a client certificate.
 	ClientPem
+	// TenantPem describes a SQL tenant client certificate.
+	TenantPem
+	// TenantSigningPem describes a SQL tenant signing certificate.
+	TenantSigningPem
 
 	// Maximum allowable permissions.
 	maxKeyPermissions os.FileMode = 0700
-	// Filename extenstions.
-	certExtension = `.crt`
-	keyExtension  = `.key`
+
+	// Maximum allowable permissions if file is owned by root.
+	maxGroupKeyPermissions os.FileMode = 0740
+
 	// Certificate directory permissions.
 	defaultCertsDirPerm = 0700
 )
 
-func (p pemUsage) String() string {
+func isCA(usage PemUsage) bool {
+	return usage == CAPem || usage == ClientCAPem || usage == TenantCAPem || usage == UICAPem
+}
+
+func (p PemUsage) String() string {
 	switch p {
 	case CAPem:
-		return "Certificate Authority"
+		return "CA"
+	case ClientCAPem:
+		return "Client CA"
+	case TenantCAPem:
+		return "Tenant Client CA"
+	case UICAPem:
+		return "UI CA"
 	case NodePem:
 		return "Node"
+	case UIPem:
+		return "UI"
 	case ClientPem:
 		return "Client"
+	case TenantPem:
+		return "Tenant Client"
+	case TenantSigningPem:
+		return "Tenant Signing"
 	default:
 		return "unknown"
 	}
@@ -112,7 +109,7 @@ func (p pemUsage) String() string {
 // If Err != nil, the CertInfo must NOT be used.
 type CertInfo struct {
 	// FileUsage describes the use of this certificate.
-	FileUsage pemUsage
+	FileUsage PemUsage
 
 	// Filename is the base filename of the certificate.
 	Filename string
@@ -141,13 +138,83 @@ type CertInfo struct {
 	Error error
 }
 
-func exceedsPermissions(objectMode, allowedMode os.FileMode) bool {
-	mask := os.FileMode(0777) ^ allowedMode
-	return mask&objectMode != 0
-}
+// CertInfoFromFilename takes a filename and attempts to determine the
+// certificate usage (ca, node, etc..).
+func CertInfoFromFilename(filename string) (*CertInfo, error) {
+	parts := strings.Split(filename, `.`)
+	numParts := len(parts)
 
-func isCertificateFile(filename string) bool {
-	return strings.HasSuffix(filename, certExtension)
+	if numParts < 2 {
+		return nil, errors.New("not enough parts found")
+	}
+
+	var fileUsage PemUsage
+	var name string
+	prefix := parts[0]
+	switch parts[0] {
+	case `ca`:
+		fileUsage = CAPem
+		if numParts != 2 {
+			return nil, errors.Errorf("CA certificate filename should match %s", certnames.CACertFilename())
+		}
+	case `ca-client`:
+		fileUsage = ClientCAPem
+		if numParts != 2 {
+			return nil, errors.Errorf("client CA certificate filename should match %s", certnames.ClientCACertFilename())
+		}
+	case `ca-client-tenant`:
+		fileUsage = TenantCAPem
+		if numParts != 2 {
+			return nil, errors.Errorf("tenant CA certificate filename should match %s", certnames.TenantClientCACertFilename())
+		}
+	case `ca-ui`:
+		fileUsage = UICAPem
+		if numParts != 2 {
+			return nil, errors.Errorf("UI CA certificate filename should match %s", certnames.UICACertFilename())
+		}
+	case `node`:
+		fileUsage = NodePem
+		if numParts != 2 {
+			return nil, errors.Errorf("node certificate filename should match %s", certnames.NodeCertFilename())
+		}
+	case `ui`:
+		fileUsage = UIPem
+		if numParts != 2 {
+			return nil, errors.Errorf("UI certificate filename should match %s", certnames.UIServerCertFilename())
+		}
+	case `client`:
+		fileUsage = ClientPem
+		// Strip prefix and suffix and re-join middle parts.
+		name = strings.Join(parts[1:numParts-1], `.`)
+		if len(name) == 0 {
+			return nil, errors.Errorf("client certificate filename should match %s",
+				certnames.ClientCertFilename(username.MakeSQLUsernameFromPreNormalizedString("<user>")))
+		}
+	case `client-tenant`:
+		fileUsage = TenantPem
+		// Strip prefix and suffix and re-join middle parts.
+		name = strings.Join(parts[1:numParts-1], `.`)
+		if len(name) == 0 {
+			return nil, errors.Errorf("tenant certificate filename should match %s",
+				certnames.TenantCertFilename("<tenantid>"))
+		}
+	case `tenant-signing`:
+		fileUsage = TenantSigningPem
+		// Strip prefix and suffix and re-join middle parts.
+		name = strings.Join(parts[1:numParts-1], `.`)
+		if len(name) == 0 {
+			return nil, errors.Errorf("tenant signing certificate filename should match %s",
+				certnames.TenantSigningCertFilename("<tenantid>"))
+		}
+	default:
+		return nil, errors.Errorf("unknown prefix %q", prefix)
+	}
+
+	return &CertInfo{
+		FileUsage: fileUsage,
+		Filename:  filename,
+		Name:      name,
+	}, nil
 }
 
 // CertificateLoader searches for certificates and keys in the certs directory.
@@ -182,12 +249,12 @@ func (cl *CertificateLoader) MaybeCreateCertsDir() error {
 		return nil
 	}
 
-	if !os.IsNotExist(err) {
-		return errors.Wrapf(err, "could not stat certs directory %s", cl.certsDir)
+	if !oserror.IsNotExist(err) {
+		return makeErrorf(err, "could not stat certs directory %s", cl.certsDir)
 	}
 
 	if err := os.Mkdir(cl.certsDir, defaultCertsDirPerm); err != nil {
-		return errors.Wrapf(err, "could not create certs directory %s", cl.certsDir)
+		return makeErrorf(err, "could not create certs directory %s", cl.certsDir)
 	}
 	return nil
 }
@@ -202,12 +269,12 @@ func (cl *CertificateLoader) TestDisablePermissionChecks() {
 // usage, and looks for their keys.
 // It populates the certificates field.
 func (cl *CertificateLoader) Load() error {
-	fileInfos, err := assetLoaderImpl.ReadDir(cl.certsDir)
+	fileInfos, err := securityassets.GetLoader().ReadDir(cl.certsDir)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if oserror.IsNotExist(err) {
 			// Directory does not exist.
 			if log.V(3) {
-				log.Infof(context.Background(), "missing certs directory %s", cl.certsDir)
+				log.Dev.Infof(context.Background(), "missing certs directory %s", cl.certsDir)
 			}
 			return nil
 		}
@@ -215,7 +282,7 @@ func (cl *CertificateLoader) Load() error {
 	}
 
 	if log.V(3) {
-		log.Infof(context.Background(), "scanning certs directory %s", cl.certsDir)
+		log.Dev.Infof(context.Background(), "scanning certs directory %s", cl.certsDir)
 	}
 
 	// Walk the directory contents.
@@ -226,35 +293,43 @@ func (cl *CertificateLoader) Load() error {
 		if info.IsDir() {
 			// Skip subdirectories.
 			if log.V(3) {
-				log.Infof(context.Background(), "skipping sub-directory %s", fullPath)
+				log.Dev.Infof(context.Background(), "skipping sub-directory %s", fullPath)
 			}
 			continue
 		}
 
-		if !isCertificateFile(filename) {
+		if !certnames.IsCertificateFilename(filename) {
 			if log.V(3) {
-				log.Infof(context.Background(), "skipping non-certificate file %s", filename)
+				log.Dev.Infof(context.Background(), "skipping non-certificate file %s", filename)
 			}
 			continue
 		}
 
 		// Build the info struct from the filename.
-		ci, err := cl.certInfoFromFilename(filename)
+		ci, err := CertInfoFromFilename(filename)
 		if err != nil {
-			log.Warningf(context.Background(), "bad filename %s: %v", fullPath, err)
+			log.Dev.Warningf(context.Background(), "bad filename %s: %v", fullPath, err)
 			continue
 		}
+
+		// Read the cert file contents.
+		fullCertPath := filepath.Join(cl.certsDir, filename)
+		certPEMBlock, err := securityassets.GetLoader().ReadFile(fullCertPath)
+		if err != nil {
+			log.Dev.Warningf(context.Background(), "could not read certificate file %s: %v", fullPath, err)
+		}
+		ci.FileContents = certPEMBlock
 
 		// Parse certificate, then look for the private key.
 		// Errors are persisted for better visibility later.
 		if err := parseCertificate(ci); err != nil {
-			log.Warningf(context.Background(), "could not parse certificate for %s: %v", fullPath, err)
+			log.Dev.Warningf(context.Background(), "could not parse certificate for %s: %v", fullPath, err)
 			ci.Error = err
 		} else if err := cl.findKey(ci); err != nil {
-			log.Warningf(context.Background(), "error finding key for %s: %v", fullPath, err)
+			log.Dev.Warningf(context.Background(), "error finding key for %s: %v", fullPath, err)
 			ci.Error = err
 		} else if log.V(3) {
-			log.Infof(context.Background(), "found certificate %s", ci.Filename)
+			log.Dev.Infof(context.Background(), "found certificate %s", ci.Filename)
 		}
 
 		cl.certificates = append(cl.certificates, ci)
@@ -263,71 +338,21 @@ func (cl *CertificateLoader) Load() error {
 	return nil
 }
 
-// certInfoFromFilename takes a filename and attempts to determine the
-// certificate usage (ca, node, etc..).
-func (cl *CertificateLoader) certInfoFromFilename(filename string) (*CertInfo, error) {
-	parts := strings.Split(filename, `.`)
-	numParts := len(parts)
-
-	if numParts < 2 {
-		return nil, errors.New("not enough parts found")
-	}
-
-	var pu pemUsage
-	var name string
-	prefix := parts[0]
-	switch parts[0] {
-	case `ca`:
-		pu = CAPem
-		if numParts != 2 {
-			return nil, errors.Errorf("CA certificate filename should match ca%s", certExtension)
-		}
-	case `node`:
-		pu = NodePem
-		if numParts != 2 {
-			return nil, errors.Errorf("node certificate filename should match node%s", certExtension)
-		}
-	case `client`:
-		pu = ClientPem
-		// strip prefix and suffix and re-join middle parts.
-		name = strings.Join(parts[1:numParts-1], `.`)
-		if len(name) == 0 {
-			return nil, errors.Errorf("client certificate filename should match client.<user>%s", certExtension)
-		}
-	default:
-		return nil, errors.Errorf("unknown prefix %q", prefix)
-	}
-
-	// Read cert file contents.
-	fullCertPath := filepath.Join(cl.certsDir, filename)
-	certPEMBlock, err := assetLoaderImpl.ReadFile(fullCertPath)
-	if err != nil {
-		return nil, errors.Errorf("could not read certificate file: %v", err)
-	}
-
-	return &CertInfo{
-		FileUsage:    pu,
-		Filename:     filename,
-		FileContents: certPEMBlock,
-		Name:         name,
-	}, nil
-}
-
 // findKey takes a CertInfo and looks for the corresponding key file.
 // If found, sets the 'keyFilename' and returns nil, returns error otherwise.
 // Does not load CA keys.
 func (cl *CertificateLoader) findKey(ci *CertInfo) error {
-	if ci.FileUsage == CAPem {
+	if isCA(ci.FileUsage) {
 		return nil
 	}
 
-	keyFilename := strings.TrimSuffix(ci.Filename, certExtension) + keyExtension
+	keyFilename := certnames.KeyForCert(ci.Filename)
 	fullKeyPath := filepath.Join(cl.certsDir, keyFilename)
 
 	// Stat the file. This follows symlinks.
-	info, err := assetLoaderImpl.Stat(fullKeyPath)
+	info, err := securityassets.GetLoader().Stat(fullKeyPath)
 	if err != nil {
-		return errors.Errorf("could not stat key file %s: %v", fullKeyPath, err)
+		return errors.Wrapf(err, "could not stat key file %s", fullKeyPath)
 	}
 
 	// Only regular files are supported (after following symlinks).
@@ -337,18 +362,16 @@ func (cl *CertificateLoader) findKey(ci *CertInfo) error {
 	}
 
 	if !cl.skipPermissionChecks {
-		// Check permissions bits.
-		filePerm := fileMode.Perm()
-		if exceedsPermissions(filePerm, maxKeyPermissions) {
-			return errors.Errorf("key file %s has permissions %s, exceeds %s",
-				fullKeyPath, filePerm, maxKeyPermissions)
+		aclInfo := sysutil.GetFileACLInfo(info)
+		if err = checkFilePermissions(os.Getgid(), fullKeyPath, aclInfo); err != nil {
+			return err
 		}
 	}
 
 	// Read key file.
-	keyPEMBlock, err := assetLoaderImpl.ReadFile(fullKeyPath)
+	keyPEMBlock, err := securityassets.GetLoader().ReadFile(fullKeyPath)
 	if err != nil {
-		return errors.Errorf("could not read key file %s: %v", fullKeyPath, err)
+		return errors.Wrapf(err, "could not read key file %s", fullKeyPath)
 	}
 
 	ci.KeyFilename = keyFilename
@@ -360,7 +383,7 @@ func (cl *CertificateLoader) findKey(ci *CertInfo) error {
 // The Error field must be nil
 func parseCertificate(ci *CertInfo) error {
 	if ci.Error != nil {
-		return errors.Wrapf(ci.Error, "parseCertificate called on bad CertInfo object: %s", ci.Filename)
+		return makeErrorf(ci.Error, "parseCertificate called on bad CertInfo object: %s", ci.Filename)
 	}
 
 	if len(ci.FileContents) == 0 {
@@ -370,7 +393,7 @@ func parseCertificate(ci *CertInfo) error {
 	// PEM-decode the file.
 	derCerts, err := PEMToCertificates(ci.FileContents)
 	if err != nil {
-		return errors.Wrapf(err, "failed to parse certificate file %s as PEM", ci.Filename)
+		return makeErrorf(err, "failed to parse certificate file %s as PEM", ci.Filename)
 	}
 
 	// Make sure we get at least one certificate.
@@ -379,20 +402,21 @@ func parseCertificate(ci *CertInfo) error {
 	}
 
 	certs := make([]*x509.Certificate, len(derCerts))
-	var latest time.Time
+	var expires time.Time
 	for i, c := range derCerts {
 		x509Cert, err := x509.ParseCertificate(c.Bytes)
 		if err != nil {
-			return errors.Wrapf(err, "failed to parse certificate at position %d in file %s", i, ci.Filename)
+			return makeErrorf(err, "failed to parse certificate %d in file %s", i, ci.Filename)
 		}
 
-		if x509Cert.NotAfter.After(latest) {
-			latest = x509Cert.NotAfter
+		if i == 0 {
+			// Expiration from the first certificate.
+			expires = x509Cert.NotAfter
 		}
 		certs[i] = x509Cert
 	}
 
 	ci.ParsedCertificates = certs
-	ci.ExpirationTime = latest
+	ci.ExpirationTime = expires
 	return nil
 }

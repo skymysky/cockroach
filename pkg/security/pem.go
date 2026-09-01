@@ -1,38 +1,29 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package security
 
 import (
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"io"
 	"os"
 	"strings"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // WritePEMToFile writes an arbitrary number of PEM blocks to a file.
 // The file "path" is created with "mode" and WRONLY|CREATE.
 // If overwrite is true, the file will be overwritten if it exists.
 func WritePEMToFile(path string, mode os.FileMode, overwrite bool, blocks ...*pem.Block) error {
-	flags := os.O_WRONLY | os.O_CREATE
+	flags := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
 	if !overwrite {
 		flags |= os.O_EXCL
 	}
@@ -43,11 +34,34 @@ func WritePEMToFile(path string, mode os.FileMode, overwrite bool, blocks ...*pe
 
 	for _, p := range blocks {
 		if err := pem.Encode(f, p); err != nil {
-			return errors.Errorf("could not encode PEM block: %v", err)
+			return errors.Wrap(err, "could not encode PEM block")
 		}
 	}
 
 	return f.Close()
+}
+
+// SafeWriteToFile writes the passed-in bytes to a file.
+// The file "path" is created with "mode" and WRONLY|CREATE.
+// If overwrite is true, the file will be overwritten if it exists.
+func SafeWriteToFile(path string, mode os.FileMode, overwrite bool, contents []byte) error {
+	flags := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	if !overwrite {
+		flags |= os.O_EXCL
+	}
+	f, err := os.OpenFile(path, flags, mode)
+	if err != nil {
+		return err
+	}
+
+	n, err := f.Write(contents)
+	if err == nil && n < len(contents) {
+		err = io.ErrShortWrite
+	}
+	if err1 := f.Close(); err == nil {
+		err = err1
+	}
+	return err
 }
 
 // PrivateKeyToPEM generates a PEM block from a private key.
@@ -58,12 +72,23 @@ func PrivateKeyToPEM(key crypto.PrivateKey) (*pem.Block, error) {
 	case *ecdsa.PrivateKey:
 		bytes, err := x509.MarshalECPrivateKey(k)
 		if err != nil {
-			return nil, errors.Errorf("error marshalling ECDSA key: %s", err)
+			return nil, errors.Wrap(err, "error marshaling ECDSA key")
 		}
 		return &pem.Block{Type: "EC PRIVATE KEY", Bytes: bytes}, nil
+	case ed25519.PrivateKey:
+		bytes, err := x509.MarshalPKCS8PrivateKey(k)
+		if err != nil {
+			return nil, errors.Wrap(err, "error marshaling Ed25519 key")
+		}
+		return &pem.Block{Type: "PRIVATE KEY", Bytes: bytes}, nil
 	default:
 		return nil, errors.Errorf("unknown key type: %v", k)
 	}
+}
+
+// PrivateKeyToPKCS8 encodes a private key into PKCS#8.
+func PrivateKeyToPKCS8(key crypto.PrivateKey) ([]byte, error) {
+	return x509.MarshalPKCS8PrivateKey(key)
 }
 
 // PEMToCertificates parses multiple certificate PEM blocks and returns them.
@@ -113,7 +138,7 @@ func parsePrivateKey(der []byte) (crypto.PrivateKey, error) {
 	}
 	if key, err := x509.ParsePKCS8PrivateKey(der); err == nil {
 		switch key := key.(type) {
-		case *rsa.PrivateKey, *ecdsa.PrivateKey:
+		case *rsa.PrivateKey, *ecdsa.PrivateKey, ed25519.PrivateKey:
 			return key, nil
 		default:
 			return nil, errors.New("found unknown private key type in PKCS#8 wrapping")

@@ -1,18 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Andrei Matei (andreimatei1@gmail.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package testutils
 
@@ -24,12 +13,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
+	"github.com/cockroachdb/errors"
 )
 
 // RunEchoServer runs a network server that accepts one connection from ln and
@@ -112,7 +100,7 @@ func TestPartitionableConnBasic(t *testing.T) {
 	defer pConn.Close()
 
 	exp := "let's see if this value comes back\n"
-	fmt.Fprintf(pConn, exp)
+	fmt.Fprint(pConn, exp)
 	got, err := bufio.NewReader(pConn).ReadString('\n')
 	if err != nil {
 		t.Fatal(err)
@@ -158,7 +146,7 @@ func TestPartitionableConnPartitionC2S(t *testing.T) {
 
 	// Client sends data.
 	exp := "let's see when this value comes back\n"
-	fmt.Fprintf(pConn, exp)
+	fmt.Fprint(pConn, exp)
 
 	// In the background, the client waits on a read.
 	clientDoneCh := make(chan error)
@@ -180,6 +168,8 @@ func TestPartitionableConnPartitionC2S(t *testing.T) {
 		var err error
 		select {
 		case err = <-clientDoneCh:
+			// NB: errors.Wrapf(nil, ...) returns nil.
+			// nolint:errwrap
 			err = errors.Errorf("unexpected reply while partitioned: %v", err)
 		case buf := <-serverSideCh:
 			err = errors.Errorf("server was not supposed to have received data while partitioned: %q", buf)
@@ -241,7 +231,7 @@ func TestPartitionableConnPartitionS2C(t *testing.T) {
 
 	// Client sends data.
 	exp := "let's see when this value comes back\n"
-	fmt.Fprintf(pConn, exp)
+	fmt.Fprint(pConn, exp)
 
 	if s := <-serverSideCh; string(s) != exp {
 		t.Fatalf("expected server to receive %q, got %q", exp, s)

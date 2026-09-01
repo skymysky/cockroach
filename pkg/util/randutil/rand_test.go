@@ -1,18 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Ben Darnell
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package randutil_test
 
@@ -54,6 +43,37 @@ func TestRandBytes(t *testing.T) {
 		x := randutil.RandBytes(rand, i)
 		if len(x) != i {
 			t.Errorf("got array with unexpected length: %d (expected %d)", len(x), i)
+		}
+	}
+}
+
+func TestTestRand(t *testing.T) {
+	n1 := func() map[int]bool {
+		numbers := make(map[int]bool)
+		rand1, _ := randutil.NewTestRand()
+		rand2, _ := randutil.NewTestRand()
+		numbers[rand1.Int()] = true
+		numbers[rand1.Int()] = true
+		numbers[rand2.Int()] = true
+		numbers[rand2.Int()] = true
+		return numbers
+	}()
+	n2 := func() map[int]bool {
+		numbers := make(map[int]bool)
+		rand1, _ := randutil.NewTestRand()
+		rand2, _ := randutil.NewTestRand()
+		numbers[rand1.Int()] = true
+		numbers[rand1.Int()] = true
+		numbers[rand2.Int()] = true
+		numbers[rand2.Int()] = true
+		return numbers
+	}()
+	if len(n1) != len(n2) {
+		t.Errorf("expected the same random numbers; got lengths %d and %d", len(n1), len(n2))
+	}
+	for k := range n1 {
+		if !n2[k] {
+			t.Errorf("expected the same random numbers; got unique number %d", k)
 		}
 	}
 }

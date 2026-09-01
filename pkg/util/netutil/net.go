@@ -1,42 +1,32 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package netutil
 
 import (
+	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strings"
 	"time"
 
-	"google.golang.org/grpc"
-
-	"golang.org/x/net/context"
-	"golang.org/x/net/http2"
-
 	"github.com/cockroachdb/cmux"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
+	"golang.org/x/net/http2"
+	"google.golang.org/grpc"
 )
 
 // ListenAndServeGRPC creates a listener and serves the specified grpc Server
-// on it, closing the listener when signalled by the stopper.
+// on it, closing the listener when signaled by the stopper.
 func ListenAndServeGRPC(
 	stopper *stop.Stopper, server *grpc.Server, addr net.Addr,
 ) (net.Listener, error) {
@@ -44,83 +34,138 @@ func ListenAndServeGRPC(
 	if err != nil {
 		return ln, err
 	}
-
-	ctx := context.TODO()
-
-	stopper.RunWorker(ctx, func(context.Context) {
-		<-stopper.ShouldQuiesce()
-		FatalIfUnexpected(ln.Close())
-		<-stopper.ShouldStop()
-		server.Stop()
-	})
-
-	stopper.RunWorker(ctx, func(context.Context) {
-		FatalIfUnexpected(server.Serve(ln))
-	})
+	if err := ServeGRPC(stopper, server, ln); err != nil {
+		return nil, err
+	}
 	return ln, nil
 }
 
-var httpLogger = log.NewStdLogger(log.Severity_ERROR)
+func ServeGRPC(stopper *stop.Stopper, server *grpc.Server, ln net.Listener) error {
+	ctx := context.TODO()
 
-// Server is a thin wrapper around http.Server. See MakeServer for more detail.
-type Server struct {
+	stopper.AddCloser(stop.CloserFn(server.Stop))
+	waitQuiesce := func(context.Context) {
+		<-stopper.ShouldQuiesce()
+		FatalIfUnexpected(ln.Close())
+	}
+	if err := stopper.RunAsyncTask(ctx, "listen-quiesce", waitQuiesce); err != nil {
+		waitQuiesce(ctx)
+		return err
+	}
+
+	return stopper.RunAsyncTask(ctx, "serve", func(context.Context) {
+		FatalIfUnexpected(server.Serve(ln))
+	})
+}
+
+var httpLogger = log.NewStdLogger(severity.ERROR, "net/http")
+
+// HTTPServer is a thin wrapper around http.Server. See MakeHTTPServer for more detail.
+type HTTPServer struct {
 	*http.Server
 }
 
-// MakeServer constructs a Server that tracks active connections, closing them
-// when signalled by stopper.
-func MakeServer(stopper *stop.Stopper, tlsConfig *tls.Config, handler http.Handler) Server {
+// MakeHTTPServer constructs a http.Server that tracks active connections,
+// closing them when signaled by stopper.
+func MakeHTTPServer(
+	ctx context.Context, stopper *stop.Stopper, tlsConfig *tls.Config, handler http.Handler,
+) HTTPServer {
 	var mu syncutil.Mutex
 	activeConns := make(map[net.Conn]struct{})
-	server := Server{
+	server := HTTPServer{
 		Server: &http.Server{
 			Handler:   handler,
 			TLSConfig: tlsConfig,
 			ConnState: func(conn net.Conn, state http.ConnState) {
 				mu.Lock()
+				defer mu.Unlock()
 				switch state {
 				case http.StateNew:
 					activeConns[conn] = struct{}{}
 				case http.StateClosed:
 					delete(activeConns, conn)
 				}
-				mu.Unlock()
 			},
-			ErrorLog: httpLogger,
+			ErrorLog:          httpLogger,
+			ReadHeaderTimeout: 5 * time.Second,
 		},
 	}
-
-	ctx := context.TODO()
 
 	// net/http.(*Server).Serve/http2.ConfigureServer are not thread safe with
 	// respect to net/http.(*Server).TLSConfig, so we call it synchronously here.
 	if err := http2.ConfigureServer(server.Server, nil); err != nil {
-		log.Fatal(ctx, err)
+		log.Dev.Fatalf(ctx, "%v", err)
 	}
 
-	stopper.RunWorker(ctx, func(context.Context) {
-		<-stopper.ShouldStop()
+	waitQuiesce := func(context.Context) {
+		<-stopper.ShouldQuiesce()
 
 		mu.Lock()
+		defer mu.Unlock()
 		for conn := range activeConns {
 			conn.Close()
 		}
-		mu.Unlock()
-	})
+	}
+	if err := stopper.RunAsyncTask(ctx, "http2-wait-quiesce", waitQuiesce); err != nil {
+		waitQuiesce(ctx)
+	}
 
 	return server
 }
 
+// MakeTCPServer constructs a connection server that tracks active connections,
+// closing them when signaled by stopper.
+func MakeTCPServer(ctx context.Context, stopper *stop.Stopper) *TCPServer {
+	server := &TCPServer{
+		stopper:     stopper,
+		activeConns: make(map[net.Conn]struct{}),
+	}
+
+	waitQuiesce := func(context.Context) {
+		<-stopper.ShouldQuiesce()
+
+		server.mu.Lock()
+		defer server.mu.Unlock()
+		for conn := range server.activeConns {
+			conn.Close()
+		}
+	}
+	if err := stopper.RunAsyncTask(ctx, "tcp-wait-quiesce", waitQuiesce); err != nil {
+		waitQuiesce(ctx)
+	}
+	return server
+}
+
+// TCPServer is wrapper around a map of active connections.
+type TCPServer struct {
+	mu          syncutil.Mutex
+	stopper     *stop.Stopper
+	activeConns map[net.Conn]struct{}
+}
+
+func (s *TCPServer) addConn(n net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.activeConns[n] = struct{}{}
+}
+
+func (s *TCPServer) rmConn(n net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.activeConns, n)
+}
+
 // ServeWith accepts connections on ln and serves them using serveConn.
-func (s *Server) ServeWith(
-	ctx context.Context, stopper *stop.Stopper, l net.Listener, serveConn func(net.Conn),
+func (s *TCPServer) ServeWith(
+	ctx context.Context, l net.Listener, serveConn func(context.Context, net.Conn),
 ) error {
 	// Inspired by net/http.(*Server).Serve
 	var tempDelay time.Duration // how long to sleep on accept failure
 	for {
 		rw, e := l.Accept()
 		if e != nil {
-			if ne, ok := e.(net.Error); ok && ne.Temporary() {
+			//lint:ignore SA1019 see discussion at https://github.com/cockroachdb/cockroach/pull/84590#issuecomment-1192709976
+			if ne := (net.Error)(nil); errors.As(e, &ne) && ne.Temporary() {
 				if tempDelay == 0 {
 					tempDelay = 5 * time.Millisecond
 				} else {
@@ -136,28 +181,74 @@ func (s *Server) ServeWith(
 			return e
 		}
 		tempDelay = 0
-		go func() {
-			defer stopper.Recover(ctx)
-			s.Server.ConnState(rw, http.StateNew) // before Serve can return
-			serveConn(rw)
-			s.Server.ConnState(rw, http.StateClosed)
-		}()
+		taskCtx, hdl, err := s.stopper.GetHandle(ctx, stop.TaskOpts{
+			TaskName: "tcp-serve",
+		})
+		if err != nil {
+			err = errors.CombineErrors(err, rw.Close())
+			return err
+		}
+		go func(ctx context.Context) {
+			defer hdl.Activate(ctx).Release(ctx)
+			defer func() {
+				_ = rw.Close()
+			}()
+			s.addConn(rw)
+			defer s.rmConn(rw)
+			serveConn(ctx, rw)
+		}(taskCtx)
 	}
 }
 
-// IsClosedConnection returns true if err is cmux.ErrListenerClosed,
-// grpc.ErrServerStopped, io.EOF, or the net package's errClosed.
+// IsClosedConnection returns true if err is a non-temporary net.Error or is
+// cmux.ErrListenerClosed, grpc.ErrServerStopped, io.EOF, or net.ErrClosed.
 func IsClosedConnection(err error) bool {
-	return err == cmux.ErrListenerClosed ||
-		err == grpc.ErrServerStopped ||
-		err == io.EOF ||
+	if netError := net.Error(nil); errors.As(err, &netError) {
+		//lint:ignore SA1019 see discussion at https://github.com/cockroachdb/cockroach/pull/84590#issuecomment-1192709976
+		return !netError.Temporary()
+	}
+	return errors.IsAny(err, cmux.ErrListenerClosed, grpc.ErrServerStopped, io.EOF, net.ErrClosed) ||
 		strings.Contains(err.Error(), "use of closed network connection")
 }
 
-// FatalIfUnexpected calls Log.Fatal(err) unless err is nil,
-// cmux.ErrListenerClosed, or the net package's errClosed.
+// FatalIfUnexpected calls log.Fatal(err) unless err is nil, or an error that
+// comes from the net package indicating that the listener was closed or from
+// the Stopper indicating quiescence.
 func FatalIfUnexpected(err error) {
-	if err != nil && !IsClosedConnection(err) {
-		log.Fatal(context.TODO(), err)
+	if err != nil && !IsClosedConnection(err) && !errors.Is(err, stop.ErrUnavailable) {
+		log.Dev.Fatalf(context.TODO(), "%+v", err)
+	}
+}
+
+// InitialHeartbeatFailedError indicates that while attempting a GRPC
+// connection to a node, we aren't successful and have never seen a
+// heartbeat over that connection before.
+type InitialHeartbeatFailedError struct {
+	WrappedErr error
+}
+
+var _ error = (*InitialHeartbeatFailedError)(nil)
+var _ fmt.Formatter = (*InitialHeartbeatFailedError)(nil)
+var _ errors.SafeFormatter = (*InitialHeartbeatFailedError)(nil)
+
+// Error implements error.
+func (e *InitialHeartbeatFailedError) Error() string { return fmt.Sprintf("%v", e) }
+
+// Cause implements causer.
+func (e *InitialHeartbeatFailedError) Cause() error { return e.WrappedErr }
+
+// Format formats the error.
+func (e *InitialHeartbeatFailedError) Format(s fmt.State, verb rune) { errors.FormatError(e, s, verb) }
+
+// SafeFormatError implements errors.SafeFormatter.
+func (e *InitialHeartbeatFailedError) SafeFormatError(p errors.Printer) (next error) {
+	p.Printf("initial connection heartbeat failed")
+	return e.WrappedErr
+}
+
+// NewInitialHeartBeatFailedError creates a new InitialHeartbeatFailedError.
+func NewInitialHeartBeatFailedError(cause error) *InitialHeartbeatFailedError {
+	return &InitialHeartbeatFailedError{
+		WrappedErr: cause,
 	}
 }

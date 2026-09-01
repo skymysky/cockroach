@@ -1,515 +1,352 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
-	"fmt"
+	"context"
+	"sync"
 
-	"golang.org/x/net/context"
-
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
+	"github.com/cockroachdb/errors"
 )
 
-// editNode (Base, Run) is shared between all row updating
-// statements (DELETE, UPDATE, INSERT).
-
-// editNodeBase holds the common (prepare+execute) state needed to run
-// row-modifying statements.
-type editNodeBase struct {
-	p         *planner
-	rh        *returningHelper
-	tableDesc *sqlbase.TableDescriptor
-}
-
-func (p *planner) makeEditNode(
-	ctx context.Context, tn *parser.TableName, priv privilege.Kind,
-) (editNodeBase, error) {
-	tableDesc, err := p.session.tables.getTableVersion(ctx, p.txn, p.getVirtualTabler(), tn)
-	if err != nil {
-		return editNodeBase{}, err
-	}
-	// We don't support update on views, only real tables.
-	if !tableDesc.IsTable() {
-		return editNodeBase{},
-			errors.Errorf("cannot run %s on view %q - views are not updateable", priv, tn)
-	}
-
-	if err := p.CheckPrivilege(tableDesc, priv); err != nil {
-		return editNodeBase{}, err
-	}
-
-	return editNodeBase{
-		p:         p,
-		tableDesc: tableDesc,
-	}, nil
-}
-
-// editNodeRun holds the runtime (execute) state needed to run
-// row-modifying statements.
-type editNodeRun struct {
-	rows      planNode
-	tw        tableWriter
-	resultRow parser.Datums
-}
-
-func (r *editNodeRun) initEditNode(
-	ctx context.Context,
-	en *editNodeBase,
-	rows planNode,
-	tw tableWriter,
-	re parser.ReturningClause,
-	desiredTypes []parser.Type,
-) error {
-	r.rows = rows
-	r.tw = tw
-
-	rh, err := en.p.newReturningHelper(ctx, re, desiredTypes, en.tableDesc.Name, en.tableDesc.Columns)
-	if err != nil {
-		return err
-	}
-	en.rh = rh
-
-	return nil
-}
-
-func (r *editNodeRun) startEditNode(ctx context.Context, en *editNodeBase) error {
-	if sqlbase.IsSystemConfigID(en.tableDesc.GetID()) {
-		// Mark transaction as operating on the system DB.
-		if err := en.p.txn.SetSystemConfigTrigger(); err != nil {
-			return err
-		}
-	}
-
-	return r.rows.Start(ctx)
-}
-
-func (r *editNodeRun) collectSpans(ctx context.Context) (reads, writes roachpb.Spans, err error) {
-	scanReads, scanWrites, err := collectSpans(ctx, r.rows)
-	if err != nil {
-		return nil, nil, err
-	}
-	if len(scanWrites) > 0 {
-		return nil, nil, errors.Errorf("unexpected scan span writes: %v", scanWrites)
-	}
-	// TODO(nvanbenschoten): if we notice that r.rows is a ValuesClause, we
-	// may be able to contrain the tableWriter Spans.
-	writerReads, writerWrites, err := r.tw.spans()
-	if err != nil {
-		return nil, nil, err
-	}
-	sqReads, err := collectSubquerySpans(ctx, r.rows)
-	if err != nil {
-		return nil, nil, err
-	}
-	return append(scanReads, append(writerReads, sqReads...)...), writerWrites, nil
+var updateNodePool = sync.Pool{
+	New: func() interface{} {
+		return &updateNode{}
+	},
 }
 
 type updateNode struct {
-	// The following fields are populated during makePlan.
-	editNodeBase
-	n             *parser.Update
-	updateCols    []sqlbase.ColumnDescriptor
-	updateColsIdx map[sqlbase.ColumnID]int // index in updateCols slice
-	tw            tableUpdater
-	checkHelper   checkHelper
-	sourceSlots   []sourceSlot
+	singleInputPlanNode
 
-	run struct {
-		// The following fields are populated during Start().
-		editNodeRun
+	// columns is set if this UPDATE is returning any rows, to be
+	// consumed by a renderNode upstream. This occurs when there is a
+	// RETURNING clause with some scalar expressions.
+	columns colinfo.ResultColumns
+
+	run updateRun
+}
+
+var _ mutationPlanNode = &updateNode{}
+
+// updateRun contains the run-time state of updateNode during local execution.
+type updateRun struct {
+	mutationOutputHelper
+	tu tableUpdater
+
+	checkOrds checkSet
+
+	// rowsNeeded is set to true if the mutation operator needs to return the rows
+	// that were affected by the mutation.
+	rowsNeeded bool
+
+	// resultRowBuffer is used to prepare a result row for accumulation
+	// into the row container above, when rowsNeeded is set.
+	resultRowBuffer tree.Datums
+
+	// traceKV caches the current KV tracing flag.
+	traceKV bool
+
+	// rowIdxToRetIdx is the mapping from the columns in ru.FetchCols to the
+	// columns in the resultRowBuffer. A value of -1 is used to indicate
+	// that the column at that index is not part of the resultRowBuffer
+	// of the mutation. Otherwise, the value at the i-th index refers to the
+	// index of the resultRowBuffer where the i-th column is to be returned.
+	rowIdxToRetIdx []int
+
+	// numPassthrough is the number of columns in addition to the set of
+	// columns of the target table being returned, that we must pass through
+	// from the input node.
+	numPassthrough int
+
+	// regionLocalInfo handles erroring out the UPDATE when the
+	// enforce_home_region setting is on.
+	regionLocalInfo regionLocalInfoType
+
+	mustValidateOldPKValues bool
+
+	originTimestampCPutHelper row.OriginTimestampCPutHelper
+}
+
+func (r *updateRun) init(params runParams, columns colinfo.ResultColumns) {
+	if ots := params.extendedEvalCtx.SessionData().OriginTimestampForLogicalDataReplication; ots.IsSet() {
+		r.originTimestampCPutHelper.OriginTimestamp = ots
+	}
+
+	if !r.rowsNeeded {
+		return
+	}
+	r.rows = rowcontainer.NewRowContainer(
+		params.p.ExecMon().MakeBoundAccount(),
+		colinfo.ColTypeInfoFromResCols(columns),
+	)
+	r.resultRowBuffer = make([]tree.Datum, len(columns))
+	for i := range r.resultRowBuffer {
+		r.resultRowBuffer[i] = tree.DNull
 	}
 }
 
-// sourceSlot abstracts the idea that our update sources can either be tuples
-// or scalars. Tuples are for cases such as SET (a, b) = (1, 2) or SET (a, b) =
-// (SELECT 1, 2), and scalars are for situations like SET a = b. A sourceSlot
-// represents how to extract and type-check the results of the right-hand side
-// of a single SET statement. We could treat everything as tuples, including
-// scalars as tuples of size 1, and eliminate this indirection, but that makes
-// the query plan more complex.
-type sourceSlot interface {
-	// extractValues returns a slice of the values this slot is responsible for,
-	// as extracted from the row of results.
-	extractValues(resultRow parser.Datums) parser.Datums
-	// checkColumnTypes compares the types of the results that this slot refers to to the types of
-	// the columns those values will be assigned to. It returns an error if those types don't match up.
-	// It also populates the types of any placeholders by way of calling into sqlbase.CheckColumnType.
-	checkColumnTypes(row []parser.TypedExpr, pmap *parser.PlaceholderInfo) error
-}
+func (u *updateNode) startExec(params runParams) error {
+	// cache traceKV during execution, to avoid re-evaluating it for every row.
+	u.run.traceKV = params.p.ExtendedEvalContext().Tracing.KVTracingEnabled()
 
-type tupleSlot struct {
-	columns     []sqlbase.ColumnDescriptor
-	sourceIndex int
-}
+	u.run.init(params, u.columns)
 
-func (ts tupleSlot) extractValues(row parser.Datums) parser.Datums {
-	return row[ts.sourceIndex].(*parser.DTuple).D
-}
+	if err := u.run.tu.init(params.ctx, params.p.txn, params.EvalContext()); err != nil {
+		return err
+	}
 
-func (ts tupleSlot) checkColumnTypes(row []parser.TypedExpr, pmap *parser.PlaceholderInfo) error {
-	renderedResult := row[ts.sourceIndex]
-	for i, typ := range renderedResult.ResolvedType().(parser.TTuple) {
-		if err := sqlbase.CheckColumnType(ts.columns[i], typ, pmap); err != nil {
+	// Run the mutation to completion.
+	for {
+		lastBatch, err := u.processBatch(params)
+		if err != nil || lastBatch {
 			return err
 		}
 	}
-	return nil
 }
 
-type scalarSlot struct {
-	column      sqlbase.ColumnDescriptor
-	sourceIndex int
+// Next implements the planNode interface.
+func (u *updateNode) Next(_ runParams) (bool, error) {
+	return u.run.next(), nil
 }
 
-func (ss scalarSlot) extractValues(row parser.Datums) parser.Datums {
-	return row[ss.sourceIndex : ss.sourceIndex+1]
+// Values implements the planNode interface.
+func (u *updateNode) Values() tree.Datums {
+	return u.run.values()
 }
 
-func (ss scalarSlot) checkColumnTypes(row []parser.TypedExpr, pmap *parser.PlaceholderInfo) error {
-	renderedResult := row[ss.sourceIndex]
-	typ := renderedResult.ResolvedType()
-	return sqlbase.CheckColumnType(ss.column, typ, pmap)
-}
-
-// addOrMergeExpr inserts an Expr into a renderNode, attempting to reuse
-// previous renders if possible by using render.addOrMergeRender, returning the
-// column index at which the rendered value can be accessed.
-func addOrMergeExpr(
-	ctx context.Context,
-	e parser.Expr,
-	currentUpdateIdx int,
-	updateCols []sqlbase.ColumnDescriptor,
-	defaultExprs []parser.TypedExpr,
-	render *renderNode,
-) (colIdx int, err error) {
-	e = fillDefault(e, currentUpdateIdx, defaultExprs)
-	selectExpr := parser.SelectExpr{Expr: e}
-	typ := updateCols[currentUpdateIdx].Type.ToDatumType()
-	col, expr, err := render.planner.computeRender(ctx, selectExpr, typ,
-		render.sourceInfo, render.ivarHelper, autoGenerateRenderOutputName)
-	if err != nil {
-		return -1, err
-	}
-
-	return render.addOrReuseRender(col, expr, true), nil
-}
-
-// Update updates columns for a selection of rows from a table.
-// Privileges: UPDATE and SELECT on table. We currently always use a select statement.
-//   Notes: postgres requires UPDATE. Requires SELECT with WHERE clause with table.
-//          mysql requires UPDATE. Also requires SELECT with WHERE clause with table.
-// TODO(guanqun): need to support CHECK in UPDATE
-func (p *planner) Update(
-	ctx context.Context, n *parser.Update, desiredTypes []parser.Type,
-) (planNode, error) {
-	tracing.AnnotateTrace()
-
-	tn, err := p.getAliasedTableName(n.Table)
-	if err != nil {
-		return nil, err
-	}
-
-	en, err := p.makeEditNode(ctx, tn, privilege.UPDATE)
-	if err != nil {
-		return nil, err
-	}
-
-	setExprs := make([]*parser.UpdateExpr, len(n.Exprs))
-	for i, expr := range n.Exprs {
-		// Replace the sub-query nodes.
-		newExpr, err := p.replaceSubqueries(ctx, expr.Expr, len(expr.Names))
-		if err != nil {
-			return nil, err
+func (u *updateNode) processBatch(params runParams) (lastBatch bool, err error) {
+	// Consume/accumulate the rows for this batch.
+	lastBatch = false
+	for {
+		if err = params.p.cancelChecker.Check(); err != nil {
+			return false, err
 		}
-		setExprs[i] = &parser.UpdateExpr{Tuple: expr.Tuple, Expr: newExpr, Names: expr.Names}
-	}
 
-	// Determine which columns we're inserting into.
-	names, err := p.namesForExprs(setExprs)
-	if err != nil {
-		return nil, err
-	}
-
-	updateCols, err := p.processColumns(en.tableDesc, names)
-	if err != nil {
-		return nil, err
-	}
-
-	defaultExprs, err := sqlbase.MakeDefaultExprs(updateCols, &p.parser, &p.evalCtx)
-	if err != nil {
-		return nil, err
-	}
-
-	var requestedCols []sqlbase.ColumnDescriptor
-	if _, retExprs := n.Returning.(*parser.ReturningExprs); retExprs || len(en.tableDesc.Checks) > 0 {
-		// TODO(dan): This could be made tighter, just the rows needed for RETURNING
-		// exprs.
-		requestedCols = en.tableDesc.Columns
-	}
-
-	fkTables := sqlbase.TablesNeededForFKs(*en.tableDesc, sqlbase.CheckUpdates)
-	if err := p.fillFKTableMap(ctx, fkTables); err != nil {
-		return nil, err
-	}
-	ru, err := sqlbase.MakeRowUpdater(p.txn, en.tableDesc, fkTables, updateCols, requestedCols, sqlbase.RowUpdaterDefault)
-	if err != nil {
-		return nil, err
-	}
-	tw := tableUpdater{ru: ru, autoCommit: p.autoCommit}
-
-	tracing.AnnotateTrace()
-
-	// We construct a query containing the columns being updated, and then later merge the values
-	// they are being updated with into that renderNode to ideally reuse some of the queries.
-	rows, err := p.SelectClause(ctx, &parser.SelectClause{
-		Exprs: sqlbase.ColumnsSelectors(ru.FetchCols),
-		From:  &parser.From{Tables: []parser.TableExpr{n.Table}},
-		Where: n.Where,
-	}, nil, nil, nil, publicAndNonPublicColumns)
-	if err != nil {
-		return nil, err
-	}
-
-	// This capacity is an overestimate, since subqueries only take up one sourceSlot.
-	sourceSlots := make([]sourceSlot, 0, len(ru.FetchCols))
-
-	// currentUpdateIdx is the index of the first column descriptor in updateCols
-	// that is assigned to by the current setExpr.
-	currentUpdateIdx := 0
-	render := rows.(*renderNode)
-
-	for _, setExpr := range setExprs {
-		if setExpr.Tuple {
-			switch t := setExpr.Expr.(type) {
-			case *parser.Tuple:
-				// The user assigned an explicit set of values to the columns. We can't
-				// treat this case the same as when we have a subquery (and just evaluate
-				// the tuple) because when assigning a literal tuple like this it's valid
-				// to assign DEFAULT to some of the columns, which is not valid generally.
-				for _, e := range t.Exprs {
-					colIdx, err := addOrMergeExpr(ctx, e, currentUpdateIdx, updateCols, defaultExprs, render)
-					if err != nil {
-						return nil, err
-					}
-
-					sourceSlots = append(sourceSlots, scalarSlot{
-						column:      updateCols[currentUpdateIdx],
-						sourceIndex: colIdx,
-					})
-
-					currentUpdateIdx++
-				}
-			case *subquery:
-				selectExpr := parser.SelectExpr{Expr: t}
-				desiredTupleType := make(parser.TTuple, len(setExpr.Names))
-				for i := range setExpr.Names {
-					desiredTupleType[i] = updateCols[currentUpdateIdx+i].Type.ToDatumType()
-				}
-				col, expr, err := render.planner.computeRender(ctx, selectExpr, desiredTupleType,
-					render.sourceInfo, render.ivarHelper, autoGenerateRenderOutputName)
-				if err != nil {
-					return nil, err
-				}
-
-				colIdx := render.addOrReuseRender(col, expr, false)
-
-				sourceSlots = append(sourceSlots, tupleSlot{
-					columns:     updateCols[currentUpdateIdx : currentUpdateIdx+len(setExpr.Names)],
-					sourceIndex: colIdx,
-				})
-				currentUpdateIdx += len(setExpr.Names)
-			default:
-				panic(fmt.Sprintf("assigning to tuple with expression that is neither a tuple nor a subquery: %s", setExpr.Expr))
-			}
-
-		} else {
-			colIdx, err := addOrMergeExpr(ctx, setExpr.Expr, currentUpdateIdx, updateCols, defaultExprs, render)
+		// Advance one individual row.
+		if next, err := u.input.Next(params); !next {
+			lastBatch = true
 			if err != nil {
-				return nil, err
+				return false, err
 			}
+			break
+		}
 
-			sourceSlots = append(sourceSlots, scalarSlot{
-				column:      updateCols[currentUpdateIdx],
-				sourceIndex: colIdx,
-			})
-			currentUpdateIdx++
+		// Process the update for the current input row, potentially
+		// accumulating the result row for later.
+		if err = u.run.processSourceRow(params, u.input.Values()); err != nil {
+			return false, err
+		}
+
+		// Are we done yet with the current SQL-level batch?
+		if u.run.tu.currentBatchSize >= u.run.tu.maxBatchSize ||
+			u.run.tu.b.ApproximateMutationBytes() >= u.run.tu.maxBatchByteSize {
+			break
 		}
 	}
 
-	// Placeholders have their types populated in the above Select if they are part
-	// of an expression ("SET a = 2 + $1") in the type check step where those
-	// types are inferred. For the simpler case ("SET a = $1"), populate them
-	// using checkColumnType. This step also verifies that the expression
-	// types match the column types.
-	sel := rows.(*renderNode)
-	for _, sourceSlot := range sourceSlots {
-		if err := sourceSlot.checkColumnTypes(sel.render, &p.semaCtx.Placeholders); err != nil {
-			return nil, err
+	if u.run.tu.currentBatchSize > 0 {
+		if !lastBatch {
+			// We only run/commit the batch if there were some rows processed
+			// in this batch.
+			if err = u.run.tu.flushAndStartNewBatch(params.ctx); err != nil {
+				return false, err
+			}
 		}
 	}
 
-	updateColsIdx := make(map[sqlbase.ColumnID]int, len(ru.UpdateCols))
-	for i, col := range ru.UpdateCols {
-		updateColsIdx[col.ID] = i
+	if lastBatch {
+		u.run.tu.setRowsWrittenLimit(params.extendedEvalCtx.SessionData())
+		if err = u.run.tu.finalize(params.ctx); err != nil {
+			return false, err
+		}
+		// Possibly initiate a run of CREATE STATISTICS.
+		params.ExecCfg().StatsRefresher.NotifyMutation(params.ctx, u.run.tu.tableDesc(), int(u.run.rowsAffected()))
 	}
-
-	un := &updateNode{
-		n:             n,
-		editNodeBase:  en,
-		updateCols:    ru.UpdateCols,
-		updateColsIdx: updateColsIdx,
-		tw:            tw,
-		sourceSlots:   sourceSlots,
-	}
-	if err := un.checkHelper.init(ctx, p, tn, en.tableDesc); err != nil {
-		return nil, err
-	}
-	if err := un.run.initEditNode(
-		ctx, &un.editNodeBase, rows, &un.tw, n.Returning, desiredTypes); err != nil {
-		return nil, err
-	}
-	return un, nil
+	return lastBatch, nil
 }
 
-func (u *updateNode) Start(ctx context.Context) error {
-	if err := u.run.startEditNode(ctx, &u.editNodeBase); err != nil {
+// processSourceRow processes one row from the source for update and, if
+// result rows are needed, saves it in the result row container.
+func (r *updateRun) processSourceRow(params runParams, sourceVals tree.Datums) error {
+	// sourceVals contains values for the columns from the table, in the order of the
+	// table descriptor. (One per column in u.tw.ru.FetchCols)
+	//
+	// And then after that, all the extra expressions potentially added via
+	// a renderNode for the RHS of the assignments.
+
+	// oldValues is the prefix of sourceVals that corresponds to real
+	// stored columns in the table, that is, excluding the RHS assignment
+	// expressions.
+	oldValues := sourceVals[:len(r.tu.ru.FetchCols)]
+	sourceVals = sourceVals[len(oldValues):]
+
+	// The update values follow the fetch values and their order corresponds to the order of ru.UpdateCols.
+	updateValues := sourceVals[:len(r.tu.ru.UpdateCols)]
+	sourceVals = sourceVals[len(updateValues):]
+
+	// The passthrough values follow the update values.
+	passthroughValues := sourceVals[:r.numPassthrough]
+	sourceVals = sourceVals[len(passthroughValues):]
+
+	// Verify the schema constraints. For consistency with INSERT/UPSERT
+	// and compatibility with PostgreSQL, we must do this before
+	// processing the CHECK constraints.
+	if err := enforceNotNullConstraints(updateValues, r.tu.ru.UpdateCols); err != nil {
 		return err
 	}
-	return u.run.tw.init(u.p.txn)
+
+	// Run the CHECK constraints, if any. CheckHelper will either evaluate the
+	// constraints itself, or else inspect boolean columns from the input that
+	// contain the results of evaluation.
+	if !r.checkOrds.Empty() {
+		if err := checkMutationInput(
+			params.ctx, params.EvalContext(), &params.p.semaCtx, params.p.SessionData(),
+			r.tu.tableDesc(), r.checkOrds, sourceVals[:r.checkOrds.Len()],
+		); err != nil {
+			return err
+		}
+		sourceVals = sourceVals[r.checkOrds.Len():]
+	}
+
+	// Create a set of partial index IDs to not add entries or remove entries
+	// from. Put values are followed by del values.
+	var pm row.PartialIndexUpdateHelper
+	if n := len(r.tu.tableDesc().PartialIndexes()); n > 0 {
+		err := pm.Init(sourceVals[:n], sourceVals[n:n*2], r.tu.tableDesc())
+		if err != nil {
+			return err
+		}
+		sourceVals = sourceVals[n*2:]
+	}
+
+	// Keep track of the vector index partitions to update, as well as the
+	// quantized vectors. This information is passed to tableInserter.row below.
+	// Order of column values is put partitions, quantized vectors, followed by
+	// del partitions
+	var vh row.VectorIndexUpdateHelper
+	if n := len(r.tu.tableDesc().VectorIndexes()); n > 0 {
+		vh.InitForPut(sourceVals[:n], sourceVals[n:n*2], r.tu.tableDesc())
+		vh.InitForDel(sourceVals[n*2:n*3], r.tu.tableDesc())
+	}
+
+	// Error out the update if the enforce_home_region session setting is on and
+	// the row's locality doesn't match the gateway region.
+	if err := r.regionLocalInfo.checkHomeRegion(updateValues); err != nil {
+		return err
+	}
+
+	// Queue the insert in the KV batch.
+	newValues, err := r.tu.rowForUpdate(
+		params.ctx, oldValues, updateValues, pm, vh, r.originTimestampCPutHelper, r.mustValidateOldPKValues, r.traceKV,
+	)
+	if err != nil {
+		return err
+	}
+	r.onModifiedRow()
+	if !r.rowsNeeded {
+		return nil
+	}
+
+	// Result rows must be accumulated.
+	//
+	// The new values can include all columns,  so the values may contain
+	// additional columns for every newly added column not yet visible. We do
+	// not want them to be available for RETURNING.
+	//
+	// MakeUpdater guarantees that the first columns of the new values
+	// are those specified u.columns.
+	largestRetIdx := -1
+	for i := range r.rowIdxToRetIdx {
+		retIdx := r.rowIdxToRetIdx[i]
+		if retIdx >= 0 {
+			if retIdx >= largestRetIdx {
+				largestRetIdx = retIdx
+			}
+			r.resultRowBuffer[retIdx] = newValues[i]
+		}
+	}
+
+	// At this point we've extracted all the RETURNING values that are part
+	// of the target table. We must now extract the columns in the RETURNING
+	// clause that refer to other tables (from the FROM clause of the update).
+	for i := 0; i < r.numPassthrough; i++ {
+		largestRetIdx++
+		r.resultRowBuffer[largestRetIdx] = passthroughValues[i]
+	}
+
+	return r.addRow(params.ctx, r.resultRowBuffer)
 }
 
 func (u *updateNode) Close(ctx context.Context) {
-	u.run.rows.Close(ctx)
+	u.input.Close(ctx)
+	u.run.close(ctx)
+	*u = updateNode{}
+	updateNodePool.Put(u)
 }
 
-func (u *updateNode) Next(ctx context.Context) (bool, error) {
-	next, err := u.run.rows.Next(ctx)
-	if !next {
-		if err == nil {
-			// We're done. Finish the batch.
-			err = u.tw.finalize(ctx, u.p.session.Tracing.KVTracingEnabled())
-		}
-		return false, err
-	}
-
-	tracing.AnnotateTrace()
-
-	entireRow := u.run.rows.Values()
-
-	// Our updated value expressions occur immediately after the plain
-	// columns in the output.
-	oldValues := entireRow[:len(u.tw.ru.FetchCols)]
-
-	updateValues := make(parser.Datums, len(u.tw.ru.UpdateCols))
-	valueIdx := 0
-
-	for _, slot := range u.sourceSlots {
-		for _, value := range slot.extractValues(entireRow) {
-			updateValues[valueIdx] = value
-			valueIdx++
-		}
-	}
-
-	if err := u.checkHelper.loadRow(u.tw.ru.FetchColIDtoRowIndex, oldValues, false); err != nil {
-		return false, err
-	}
-	if err := u.checkHelper.loadRow(u.updateColsIdx, updateValues, true); err != nil {
-		return false, err
-	}
-	if err := u.checkHelper.check(&u.p.evalCtx); err != nil {
-		return false, err
-	}
-
-	// Ensure that the values honor the specified column widths.
-	for i := range updateValues {
-		if err := sqlbase.CheckValueWidth(u.tw.ru.UpdateCols[i], updateValues[i]); err != nil {
-			return false, err
-		}
-	}
-
-	for i, col := range u.tw.ru.UpdateCols {
-		val := updateValues[i]
-		if !col.Nullable && val == parser.DNull {
-			return false, sqlbase.NewNonNullViolationError(col.Name)
-		}
-	}
-
-	// Update the row values.
-	newValues, err := u.tw.row(
-		ctx, append(oldValues, updateValues...), u.p.session.Tracing.KVTracingEnabled(),
-	)
-	if err != nil {
-		return false, err
-	}
-
-	resultRow, err := u.rh.cookResultRow(newValues)
-	if err != nil {
-		return false, err
-	}
-	u.run.resultRow = resultRow
-
-	return true, nil
+func (u *updateNode) rowsWritten() int64 {
+	return u.run.rowsAffected()
 }
 
-// namesForExprs expands names in the tuples and subqueries in exprs.
-func (p *planner) namesForExprs(exprs parser.UpdateExprs) (parser.UnresolvedNames, error) {
-	var names parser.UnresolvedNames
-	for _, expr := range exprs {
-		if expr.Tuple {
-			n := -1
-			switch t := expr.Expr.(type) {
-			case *subquery:
-				if tup, ok := t.typ.(parser.TTuple); ok {
-					n = len(tup)
-				}
-			case *parser.Tuple:
-				n = len(t.Exprs)
-			case *parser.DTuple:
-				n = len(t.D)
+func (u *updateNode) indexRowsWritten() int64 {
+	return u.run.tu.indexRowsWritten
+}
+
+func (u *updateNode) indexBytesWritten() int64 {
+	return u.run.tu.indexBytesWritten
+}
+
+func (u *updateNode) returnsRowsAffected() bool {
+	return !u.run.rowsNeeded
+}
+
+func (u *updateNode) kvCPUTime() int64 {
+	return u.run.tu.kvCPUTime
+}
+
+func (u *updateNode) localKVCPUTime() int64 {
+	return u.run.tu.localKVCPUTime
+}
+
+func (u *updateNode) enableAutoCommit() {
+	u.run.tu.enableAutoCommit()
+}
+
+// enforceNotNullConstraints enforces NOT NULL column constraints. row and cols
+// must have the same length.
+func enforceNotNullConstraints(row tree.Datums, cols []catalog.Column) error {
+	if len(row) != len(cols) {
+		return errors.AssertionFailedf("expected length of row (%d) and columns (%d) to match",
+			len(row), len(cols))
+	}
+	for i, col := range cols {
+		if row[i] == tree.DNull {
+			if !col.IsNullable() {
+				return sqlerrors.NewNonNullViolationError(col.GetName())
 			}
-			if n < 0 {
-				return nil, errors.Errorf("unsupported tuple assignment: %T", expr.Expr)
-			}
-			if len(expr.Names) != n {
-				return nil, fmt.Errorf("number of columns (%d) does not match number of values (%d)",
-					len(expr.Names), n)
+			// Check domain NOT NULL constraint separately from column NOT NULL.
+			// Per PostgreSQL, domain NOT NULL is enforced through the domain's
+			// constraint, not the column's nullable flag.
+			colType := col.GetType()
+			if colType.TypeMeta.DomainData != nil && colType.TypeMeta.DomainData.NotNull {
+				return pgerror.Newf(
+					pgcode.NotNullViolation,
+					"domain %s does not allow null values",
+					colType.TypeMeta.Name.Basename(),
+				)
 			}
 		}
-		names = append(names, expr.Names...)
 	}
-	return names, nil
-}
-
-func fillDefault(expr parser.Expr, index int, defaultExprs []parser.TypedExpr) parser.Expr {
-	switch expr.(type) {
-	case parser.DefaultVal:
-		if defaultExprs == nil {
-			return parser.DNull
-		}
-		return defaultExprs[index]
-	}
-	return expr
-}
-
-func (u *updateNode) Values() parser.Datums {
-	return u.run.resultRow
+	return nil
 }

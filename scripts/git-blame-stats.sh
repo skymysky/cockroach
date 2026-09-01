@@ -1,5 +1,11 @@
 #!/bin/sh
 
+# Copyright 2017 The Cockroach Authors.
+#
+# Use of this software is governed by the CockroachDB Software License
+# included in the /LICENSE file.
+
+
 # This script produces the list of authors that are "git blame"d for lines in
 # .go files under the current directory.
 #
@@ -10,6 +16,9 @@
 FILE_REGEXP='\.go$'
 if [ -n "$1" ]; then FILE_REGEXP=$1; fi
 
+toplevel=$(git rev-parse --show-toplevel)
+cp ${toplevel}/scripts/.mailmap ${toplevel}/.mailmap
+
 git ls-tree -r HEAD \
   | cut -f 2 \
   | grep -E "$FILE_REGEXP" \
@@ -18,3 +27,5 @@ git ls-tree -r HEAD \
   | sort \
   | uniq -c \
   | sort -nr
+
+rm ${toplevel}/.mailmap

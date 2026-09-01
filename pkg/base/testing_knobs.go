@@ -1,18 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package base
 
@@ -25,9 +14,52 @@ type ModuleTestingKnobs interface {
 // TestingKnobs contains facilities for controlling various parts of the
 // system for testing.
 type TestingKnobs struct {
-	Store            ModuleTestingKnobs
-	SQLExecutor      ModuleTestingKnobs
-	SQLLeaseManager  ModuleTestingKnobs
-	SQLSchemaChanger ModuleTestingKnobs
-	DistSQL          ModuleTestingKnobs
+	Store                          ModuleTestingKnobs
+	KVClient                       ModuleTestingKnobs
+	RangeFeed                      ModuleTestingKnobs
+	SQLExecutor                    ModuleTestingKnobs
+	SQLLeaseManager                ModuleTestingKnobs
+	SQLSchemaChanger               ModuleTestingKnobs
+	SQLDeclarativeSchemaChanger    ModuleTestingKnobs
+	SQLTypeSchemaChanger           ModuleTestingKnobs
+	GCJob                          ModuleTestingKnobs
+	PGWireTestingKnobs             ModuleTestingKnobs
+	DistSQL                        ModuleTestingKnobs
+	SQLEvalContext                 ModuleTestingKnobs
+	NodeLiveness                   ModuleTestingKnobs
+	Server                         ModuleTestingKnobs
+	TenantTestingKnobs             ModuleTestingKnobs
+	JobsTestingKnobs               ModuleTestingKnobs
+	BackupRestore                  ModuleTestingKnobs
+	TTL                            ModuleTestingKnobs
+	Inspect                        ModuleTestingKnobs
+	SchemaTelemetry                ModuleTestingKnobs
+	Streaming                      ModuleTestingKnobs
+	UpgradeManager                 ModuleTestingKnobs
+	IndexUsageStatsKnobs           ModuleTestingKnobs
+	SQLStatsKnobs                  ModuleTestingKnobs
+	SpanConfig                     ModuleTestingKnobs
+	SQLLivenessKnobs               ModuleTestingKnobs
+	TelemetryLoggingKnobs          ModuleTestingKnobs
+	DialerKnobs                    ModuleTestingKnobs
+	ProtectedTS                    ModuleTestingKnobs
+	CapturedIndexUsageStatsKnobs   ModuleTestingKnobs
+	AdmissionControlOptions        ModuleTestingKnobs // TODO(irfansharif): Remove.
+	AdmissionControl               ModuleTestingKnobs
+	RaftTransport                  ModuleTestingKnobs
+	UnusedIndexRecommendKnobs      ModuleTestingKnobs
+	ExternalConnection             ModuleTestingKnobs
+	EventExporter                  ModuleTestingKnobs
+	EventLog                       ModuleTestingKnobs
+	LOQRecovery                    ModuleTestingKnobs
+	KeyVisualizer                  ModuleTestingKnobs
+	TenantCapabilitiesTestingKnobs ModuleTestingKnobs
+	TableStatsKnobs                ModuleTestingKnobs
+	TableMetadata                  ModuleTestingKnobs
+	LicenseTestingKnobs            ModuleTestingKnobs
+	VecIndexTestingKnobs           ModuleTestingKnobs
+	PolicyRefresherTestingKnobs    ModuleTestingKnobs
+	NodeCapacityProviderKnobs      ModuleTestingKnobs
+	CloudStorageKnobs              ModuleTestingKnobs
+	ClusterMetricsKnobs            ModuleTestingKnobs
 }

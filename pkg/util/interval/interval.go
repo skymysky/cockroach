@@ -1,6 +1,16 @@
 // Copyright ©2012 The bíogo Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// license that can be found in licenses/BSD3-biogo.store.llrb.txt.
+
+// Portions of this file are additionally subject to the following
+// license and copyright.
+//
+// Copyright 2016 The Cockroach Authors.
+//
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
+
+// This code originated in the github.com/biogo/store/interval package.
 
 // Package interval provides two implementations for an interval tree. One is
 // based on an augmented Left-Leaning Red Black tree. The other is based on an
@@ -9,23 +19,32 @@ package interval
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
+
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/errors"
 )
 
 // ErrInvertedRange is returned if an interval is used where the start value is greater
 // than the end value.
-var ErrInvertedRange = errors.New("interval: inverted range")
+var ErrInvertedRange = errors.Newf("interval: inverted range")
 
 // ErrEmptyRange is returned if an interval is used where the start value is equal
 // to the end value.
-var ErrEmptyRange = errors.New("interval: empty range")
+var ErrEmptyRange = errors.Newf("interval: empty range")
+
+// ErrNilRange is returned if an interval is used where both the start value and
+// the end value are nil. This is a specialization of ErrEmptyRange.
+var ErrNilRange = errors.Newf("interval: nil range")
 
 func rangeError(r Range) error {
 	switch r.Start.Compare(r.End) {
 	case 1:
 		return ErrInvertedRange
 	case 0:
+		if len(r.Start) == 0 && len(r.End) == 0 {
+			return ErrNilRange
+		}
 		return ErrEmptyRange
 	default:
 		return nil
@@ -57,6 +76,10 @@ type inclusiveOverlapper struct{}
 
 // Overlap checks where a and b overlap in the inclusive way.
 func (overlapper inclusiveOverlapper) Overlap(a Range, b Range) bool {
+	return overlapsInclusive(a, b)
+}
+
+func overlapsInclusive(a Range, b Range) bool {
 	return a.Start.Compare(b.End) <= 0 && b.Start.Compare(a.End) <= 0
 }
 
@@ -68,6 +91,10 @@ type exclusiveOverlapper struct{}
 
 // Overlap checks where a and b overlap in the exclusive way.
 func (overlapper exclusiveOverlapper) Overlap(a Range, b Range) bool {
+	return overlapsExclusive(a, b)
+}
+
+func overlapsExclusive(a Range, b Range) bool {
 	return a.Start.Compare(b.End) < 0 && b.Start.Compare(a.End) < 0
 }
 
@@ -90,9 +117,9 @@ type Interface interface {
 //
 // Given c = Compare(a, b):
 //
-//  c == -1  if (a.Range().Start, a.ID()) < (b.Range().Start, b.ID());
-//  c == 0 if (a.Range().Start, a.ID()) == (b.Range().Start, b.ID()); and
-//  c == 1 if (a.Range().Start, a.ID()) > (b.Range().Start, b.ID()).
+//	c == -1  if (a.Range().Start, a.ID()) < (b.Range().Start, b.ID());
+//	c == 0 if (a.Range().Start, a.ID()) == (b.Range().Start, b.ID()); and
+//	c == 1 if (a.Range().Start, a.ID()) > (b.Range().Start, b.ID()).
 //
 // "c == 0" is equivalent to "Equal(a, b) == true".
 func Compare(a, b Interface) int {
@@ -111,13 +138,13 @@ func Compare(a, b Interface) int {
 	}
 }
 
-// Equal returns a boolean indicating whethter the given Interfaces are equal to each other. If
+// Equal returns a boolean indicating whether the given Interfaces are equal to each other. If
 // "Equal(a, b) == true", "a.Range().End == b.Range().End" must hold. Otherwise, the interval tree
 // behavior is undefined. "Equal(a, b) == true" is equivalent to "Compare(a, b) == 0". But the
 // former has measurably better performance than the latter. So Equal should be used when only
 // equality state is needed.
 func Equal(a, b Interface) bool {
-	return a.Range().Start.Equal(b.Range().Start) && a.ID() == b.ID()
+	return a.ID() == b.ID() && a.Range().Start.Equal(b.Range().Start)
 }
 
 // A Comparable is a type that describes the ends of a Range.
@@ -127,10 +154,10 @@ type Comparable []byte
 // receiver and the parameter.
 //
 // Given c = a.Compare(b):
-//  c == -1 if a < b;
-//  c == 0 if a == b; and
-//  c == 1 if a > b.
 //
+//	c == -1 if a < b;
+//	c == 0 if a == b; and
+//	c == 1 if a > b.
 func (c Comparable) Compare(o Comparable) int {
 	return bytes.Compare(c, o)
 }
@@ -147,7 +174,7 @@ func (c Comparable) Equal(o Comparable) bool {
 // should traverse no further.
 type Operation func(Interface) (done bool)
 
-// Tree is an interval tree. For all the functions which have a fast argment,
+// Tree is an interval tree. For all the functions which have a fast argument,
 // fast being true means a fast operation which does not adjust node ranges. If
 // fast is false, node ranges are adjusted.
 type Tree interface {
@@ -185,6 +212,10 @@ type Tree interface {
 	// Iterator creates an iterator to iterate over all intervals stored in the
 	// tree, in-order.
 	Iterator() TreeIterator
+	// Clear this tree.
+	Clear()
+	// Clone clones the tree, returning a copy.
+	Clone() Tree
 }
 
 // TreeIterator iterates over all intervals stored in the interval tree, in-order.
@@ -195,8 +226,14 @@ type TreeIterator interface {
 	Next() (Interface, bool)
 }
 
+var useBTreeImpl = envutil.EnvOrDefaultBool("COCKROACH_INTERVAL_BTREE", false)
+
 // NewTree creates a new interval tree with the given overlapper function. It
-// uses the augmented Left-Leaning Red Black tree implementation.
+// uses the augmented Left-Leaning Red Black tree implementation unless the
+// envvar COCKROACH_INTERVAL_BTREE is set.
 func NewTree(overlapper Overlapper) Tree {
-	return newLLBRTree(overlapper)
+	if useBTreeImpl {
+		return newBTree(overlapper)
+	}
+	return newLLRBTree(overlapper)
 }

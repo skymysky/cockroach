@@ -1,27 +1,16 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package base_test
 
 import (
+	"context"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"golang.org/x/net/context"
 )
 
 func TestNodeIDContainer(t *testing.T) {
@@ -36,7 +25,7 @@ func TestNodeIDContainer(t *testing.T) {
 	}
 
 	for i := 0; i < 2; i++ {
-		n.Set(context.TODO(), 5)
+		n.Set(context.Background(), 5)
 		if val := n.Get(); val != 5 {
 			t.Errorf("value should be 5, not %d", val)
 		}
@@ -51,5 +40,39 @@ func TestNodeIDContainer(t *testing.T) {
 	}
 	if str := n.String(); str != "6" {
 		t.Errorf("string should be 6, not %s", str)
+	}
+}
+
+func TestStoreIDPebbleLog(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	tempstore := &base.StoreIDContainer{}
+	if val := tempstore.Get(); val != 0 {
+		t.Errorf("store ID for temp store should be -1, not %d", val)
+	}
+	tempstore.Set(context.Background(), base.TempStoreID)
+	if val := tempstore.Get(); val != base.TempStoreID {
+		t.Errorf(
+			"store ID for temp store is incorrect, expected %d, but got %d",
+			base.TempStoreID, val)
+	}
+	if str := tempstore.String(); str != "temp" {
+		t.Errorf("String method for temp store should return, temp, not %s", str)
+	}
+
+	store := &base.StoreIDContainer{}
+	if val := store.Get(); val != 0 {
+		t.Errorf("store ID for store should initially be 0, not %d", val)
+	}
+	if str := store.String(); str != "?" {
+		t.Errorf("initial string should be ?, not %s", str)
+	}
+
+	store.Set(context.Background(), 5)
+	if val := store.Get(); val != 5 {
+		t.Errorf("value should be 5, not %d", val)
+	}
+	if str := store.String(); str != "5" {
+		t.Errorf("string should be 5, not %s", str)
 	}
 }

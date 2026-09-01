@@ -25,14 +25,14 @@ columns, each with an ascending/descending designation; and some
 information about each column. Each column has a numeric ID that is
 unique within the table, a SQL type, and a column family ID. A column
 family is a maximal subset of columns with the same column family ID.
-For more details, see [pkg/sql/sqlbase/structured.proto].
+For more details, see [pkg/sql/catalog/descpb/structured.proto].
 
 Each row of a table gives rise to one or more KV pairs, one per column
 family as needed (see subsection NULL below). CRDB stores primary key
 data in KV keys and other data in KV values so that it can use the KV
 layer to prevent duplicate primary keys. For encoding, see
-[pkg/sql/rowwriter.go]. For decoding, see
-[pkg/sql/sqlbase/rowfetcher.go].
+[pkg/sql/row/writer.go]. For decoding, see
+[pkg/sql/row/fetcher.go].
 
 ### Key encoding
 
@@ -72,8 +72,8 @@ In conjunction with prefix freedom, the order property ensures that the
 SQL layer and the KV layer sort primary keys the same way.
 
 For more details on primary key encoding, see `EncodeTableKey`
-([pkg/sql/sqlbase/table.go]). See also `EncDatum`
-([pkg/sql/sqlbase/encoded\_datum.go]).
+([pkg/sql/rowenc/column\_type\_encoding.go]). See also `EncDatum`
+([pkg/sql/rowenc/encoded\_datum.go]).
 
 ### Value encoding
 
@@ -83,7 +83,8 @@ KV values consist of
 2.  A one-byte value type (see the enumeration `ValueType` in
     [pkg/roachpb/data.proto])
 3.  Data from where the row specified in the KV key intersects the
-    specified column family, excluding primary key data.
+    specified column family, including composite encodings of primary
+    key columns that are members of the specified column family.
 
 The value type defaults to `TUPLE`, which indicates the following
 encoding. (For other values, see subsection Single-column column
@@ -103,6 +104,23 @@ alternative for datum encoding types greater than 14, `encodeValueTag`
 sets the low four bits to `SentinelType` (15) and emits the actual datum
 encoding type next.
 
+**Note:** Values for sequences are a special case: the sequence value is
+encoded as if the sequence were a one-row, one-column table, with the
+key structured in the usual way: `/Table/<id>/<index>/<pk val>/<family>`.
+However, the value is a bare int64; it doesn't use the encoding
+specified here. This is because it is incremented using the KV
+`Increment` operation so that the increment can be done in one
+roundtrip, not a read followed by a write as would be required by a
+normal SQL `UPDATE`.
+
+An alternative design would be to teach the KV Inc operation to
+understand SQL value encoding so that the sequence could be encoded
+consistently with tables, but that would break the KV/SQL abstraction
+barrier.
+
+The code that performs generation of keys and values for primary indexes
+can be found in `prepareInsertOrUpdateBatch`([pkg/sql/row/writer.go]).
+
 ### Sentinel KV pairs
 
 The column family with ID 0 is special because it contains the primary
@@ -112,13 +130,20 @@ the KV value has other data, to guarantee that primary keys appear in at
 least one KV pair. (Even if there are other column families, their KV
 pairs may be suppressed; see subsection NULL below.)
 
+Note that in system tables that use multiple column families, such as
+system.zones or system.namespace, there may not be any sentinel KV pair at all.
+This is because of the fact that the database writes to these system tables
+using raw KV puts and does not include the logic to write a sentinel KV. KV
+decoding code that needs to understand system tables must be aware of this
+possibility.
+
 ### Single-column column families
 
 Before column families (i.e., in format version 1), non-sentinel KV keys
 had a column ID where the column family ID is now. Non-sentinel KV
 values contained exactly one datum, whose encoding was indicated by the
 one-byte value type (see `MarshalColumnValue` in
-[pkg/sql/sqlbase/table.go]). Unlike the `TUPLE` encoding, this encoding
+[pkg/sql/rowenc/column\_type\_encoding.go]). Unlike the `TUPLE` encoding, this encoding
 did not need to be prefix-free, which was a boon for strings.
 
 On upgrading to format version 2 or higher, CRDB puts each existing
@@ -126,7 +151,7 @@ column in a column family whose ID is the same as the column ID. This
 allows backward-compatible encoding and decoding. The encoder uses the
 old format for single-column column families when the ID of that column
 equals the `DefaultColumnID` of the column family
-([pkg/sql/sqlbase/structured.proto]).
+([pkg/sql/catalog/descpb/structured.proto]).
 
 ### NULL
 
@@ -262,10 +287,16 @@ Users also specify whether a secondary index should be unique. Unique
 secondary indexes constrain the table data not to have two rows where,
 for each indexed column, the data therein are non-null and equal.
 
+As of #42073 (after version 19.2), secondary indexes have been extended to
+include support for column families. These families are the same as the ones
+defined upon the table. Families will apply to the stored columns in the index.
+Like in primary indexes, column family 0 on a secondary index will always be
+present for a row so that each row in the index has at least one k/v entry.
+
 ### Key encoding
 
 The main encoding function for secondary indexes is
-`EncodeSecondaryIndex` in [pkg/sql/sqlbase/table.go]. Each row gives
+`EncodeSecondaryIndex` in [pkg/sql/rowenc/index\_encoding.go]. Each row gives
 rise to one KV pair per secondary index, whose KV key has fields
 mirroring the primary index encoding:
 
@@ -278,8 +309,8 @@ mirroring the primary index encoding:
 5.  If the index is non-unique or the row has a NULL in an indexed
     column, and the index uses the old format for stored columns, data
     from where the row intersects the stored columns
-6.  Zero (instead of the column family ID; all secondary KV pairs are
-    sentinels).
+6.  The column family ID.
+7.  When the previous field is nonzero (non-sentinel), its length in bytes.
 
 Unique indexes relegate the data in extra columns to KV values so that
 the KV layer detects constraint violations. The special case for an
@@ -290,21 +321,40 @@ achieved by including the non-indexed primary key data. For the sake of
 simplicity, data in stored columns are also included.
 
 ### Value encoding
+KV values for secondary indexes are encoded using the following rules:
 
-KV values for secondary indexes have value type `BYTES` and consist of:
+If the value corresponds to column family 0:
 
+The KV value will have value type bytes, and will consist of
 1.  If the index is unique, data from where the row intersects the
     non-indexed primary key (implicit) columns, encoded as in the KV key
 2.  If the index is unique, and the index uses the old format for stored
     columns, data from where the row intersects the stored columns,
     encoded as in the KV key
 3.  If needed, `TUPLE`-encoded bytes for non-null composite and stored
-    column data (new format).
+    column data in family 0 (new format).
 
-All of these fields are optional, so the `BYTES` value may be empty.
-Note that, in a unique index, rows with a NULL in an indexed column have
-their implicit column data stored in both the KV key and the KV value.
-(Ditto for stored column data in the old format.)
+Since column family 0 is always included, it contains extra information
+that the index stores in the value, such as composite column values and
+stored primary key columns. Note that this is different than the encoding of
+composite indexed columns values in primary key columns, where the composite
+value component of an indexed column is placed in the KV pair corresponding
+to the column family of the indexed column. All of these fields are optional,
+so the `BYTES` value may be empty. Note that, in a unique index, rows with
+a NULL in an indexed column have their implicit column data stored in both the
+KV key and the KV value. (Ditto for stored column data in the old format.)
+
+For indexes with more than one column family, the remaining column families'
+KV values will have value type `TUPLE` and will consist of all stored
+columns in that family in the `TUPLE` encoded format.
+
+### Backwards Compatibility With Indexes Encoded Without Families
+
+Index descriptors hold on to a version bit that denotes what encoding
+format the descriptor was written in. The default value of the bit denotes
+the original secondary index encoding, and indexes created when all
+nodes in a cluster are version 20.1 or greater will have the version representing
+secondary indexes with column families.
 
 ### Example dump
 
@@ -432,6 +482,26 @@ Index ID 3 is the non-unique secondary index `i3`.
                 ^------ ^                                      ^-
          Indexed column Implicit column                    BYTES
 
+### Example dump with families
+```
+CREATE TABLE t (
+	a INT, b INT, c INT, d INT, e INT, f INT,
+	PRIMARY KEY (a, b),
+	UNIQUE INDEX i (d, e) STORING (c, f),
+	FAMILY (a, b, c), FAMILY (d, e), FAMILY (f)
+);
+
+INSERT INTO t VALUES (1, 2, 3, 4, 5, 6);
+
+/Table/52/2/4/5/0/1572546219.386986000,0 : 0xBDD6D93003898A3306
+            ^-- ^                                    ^_^_______      
+ Indexed cols   Column family 0                  BYTES Stored PK cols + column c
+// Notice that /Table/52/2/4/5/1/1/ is not present, because these values are already indexed
+/Table/52/2/4/5/2/1/1572546219.386986000,0 : 0x46CC99AE0A630C
+                ^__                                    ^_^___ 
+         Column Family 2                            TUPLE  column f
+```
+
 ### Composite encoding
 
 Secondary indexes use key encoding for all indexed columns, implicit
@@ -474,91 +544,18 @@ Index ID 2 is the secondary index `i2`.
                 ^------------------------------------------------------------                                        ^-^---------
                 Indexed column: Collation key for 'Ted'                                                          BYTES 'Ted'
 
-Interleaving
-------------
-
-By default, indexes (in CRDB terminology, so both primary and secondary)
-occupy disjoint KV key spans. Users can request that an index be
-interleaved with another index, which improves the efficiency of joining
-them.
-
-One index, the parent, must have a primary key that, ignoring column
-names, is a prefix (not necessarily proper) of the other index, the
-child. The parent, which currently must be a primary index, has its
-usual encoding. To encode a KV key in the child, encode it as if it were
-in the parent but with an interleaving sentinel
-(`EncodeNotNullDescending` in [pkg/util/encoding/encoding.go]) where the
-column family ID would be. Append the non-interleaved child encoding but
-without the parent columns. The sentinel informs the decoder that the
-row does not belong to the parent table.
-
-Note that the parent may itself be interleaved. In general, the
-interleaving relationships constitute an [arborescence].
-
-Example schema and data:
-
-    CREATE TABLE owners (
-      owner_id INT PRIMARY KEY,
-      owner STRING
-    );
-
-    CREATE TABLE accounts (
-      owner_id INT,
-      account_id INT,
-      balance DECIMAL,
-      PRIMARY KEY (owner_id, account_id)
-    ) INTERLEAVE IN PARENT owners (owner_id);
-
-    INSERT INTO owners VALUES (19, 'Alice');
-    INSERT INTO accounts VALUES (19, 83, 10000.50);
-
-Example dump:
-
-    /Table/51/1/19/0/1489433137.133889094,0 : 0xDBCE04550A2605416C696365
-           ^- ^ ^- ^                            ^-------^-^^^-----------
-           |  | |  |                            |       | |||
-           Table ID (owners)                    Checksum| |||
-              | |  |                                    | |||
-              Index ID                                  Value type (TUPLE)
-                |  |                                      |||
-                Primary key (owner_id = 19)               Column ID difference
-                   |                                       ||
-                   Column family ID                        Datum encoding type (Bytes)
-                                                            |
-                                                            Datum encoding ('Alice')
-
-    /Table/51/1/19/#/52/1/83/0/1489433137.137447008,0 : 0x691956790A3505348D0F4272
-           ^- ^ ^- ^ ^- ^ ^- ^                            ^-------^-^^^-----------
-           |  | |  | |  | |  |                            |       | |||
-           Table ID (owners) |                            Checksum| |||
-              | |  | |  | |  |                                    | |||
-              Index ID  | |  |                                    Value type (TUPLE)
-                |  | |  | |  |                                      |||
-                Primary key (owner_id = 19)                         Column ID difference
-                   | |  | |  |                                       ||
-                   Interleaving sentinel                             Datum encoding type (Decimal)
-                     |  | |  |                                        |
-                     Table ID (accounts)                              Datum encoding (10000.50)
-                        | |  |
-                        Index ID
-                          |  |
-                          Primary key (account_id = 83)
-                             |
-                             Column family ID
-
   [pkg/util/encoding/encoding.go]: https://github.com/cockroachdb/cockroach/blob/master/pkg/util/encoding/encoding.go
   [SQL in CockroachDB: Mapping Table Data to Key-Value Storage]: https://www.cockroachlabs.com/blog/sql-in-cockroachdb-mapping-table-data-to-key-value-storage/
   [Implementing Column Families in CockroachDB]: https://www.cockroachlabs.com/blog/sql-cockroachdb-column-families/
-  [column families RFC]: https://github.com/cockroachdb/cockroach/blob/master/docs/RFCS/sql_column_families.md
-  [interleaving RFC]: https://github.com/cockroachdb/cockroach/blob/master/docs/RFCS/sql_interleaved_tables.md
-  [pkg/sql/sqlbase/structured.proto]: https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/sqlbase/structured.proto
-  [pkg/sql/rowwriter.go]: https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/sqlbase/rowwriter.go
-  [pkg/sql/sqlbase/rowfetcher.go]: https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/sqlbase/rowfetcher.go
+  [column families RFC]: https://github.com/cockroachdb/cockroach/blob/master/docs/RFCS/20151214_sql_column_families.md
+  [interleaving RFC]: https://github.com/cockroachdb/cockroach/blob/master/docs/RFCS/20160624_sql_interleaved_tables.md
+  [pkg/sql/catalog/descpb/structured.proto]: https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/catalog/descpb/structured.proto
+  [pkg/sql/row/writer.go]: https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/row/writer.go
+  [pkg/sql/row/fetcher.go]: https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/row/fetcher.go
   [prefix-free]: https://en.wikipedia.org/wiki/Prefix_code
   [new `DECIMAL` encoding]: https://github.com/cockroachdb/cockroach/issues/13384#issuecomment-277120394
-  [pkg/sql/sqlbase/table.go]: https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/sqlbase/table.go
-  [pkg/sql/sqlbase/encoded\_datum.go]: https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/sqlbase/encoded_datum.go
+  [pkg/sql/rowenc/column\_type\_encoding.go]: https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/rowenc/column_type_encoding.go
+  [pkg/sql/rowenc/encoded\_datum.go]: https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/rowenc/encoded_datum.go
   [pkg/roachpb/data.proto]: https://github.com/cockroachdb/cockroach/blob/master/pkg/roachpb/data.proto
   [Unicode Collation Algorithm]: http://unicode.org/reports/tr10/
   [an efficient partial inverse]: http://stackoverflow.com/q/23609457/2144669
-  [arborescence]: https://en.wikipedia.org/wiki/Arborescence_(graph_theory)

@@ -1,91 +1,161 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-// Package securitytest embeds the TLS test certificates.
+// Package securitytest provides test TLS certificates for CockroachDB tests.
+// Certificates are generated programmatically at runtime on first access,
+// eliminating the need for static certificate files that expire periodically.
 package securitytest
 
 import (
-	"io/ioutil"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
-	"testing"
+	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
+	"github.com/cockroachdb/errors"
 )
 
-//go:generate go-bindata -mode 0600 -modtime 1400000000 -pkg securitytest -o embedded.go -ignore README.md test_certs
-//go:generate gofmt -s -w embedded.go
-//go:generate goimports -w embedded.go
+// fileInfo implements os.FileInfo backed by in-memory cert data.
+type fileInfo struct {
+	name string
+	size int64
+	dir  bool
+}
 
-// RestrictedCopy creates an on-disk copy of the embedded security asset
+func (i *fileInfo) Name() string { return i.name }
+func (i *fileInfo) Size() int64  { return i.size }
+func (i *fileInfo) Mode() fs.FileMode {
+	if i.dir {
+		return 0700 | fs.ModeDir
+	}
+	return 0700
+}
+func (i *fileInfo) ModTime() time.Time { return time.Time{} }
+func (i *fileInfo) IsDir() bool        { return i.dir }
+func (i *fileInfo) Sys() any           { return nil }
+
+var _ os.FileInfo = &fileInfo{}
+
+// dirEntry implements os.DirEntry backed by in-memory cert data.
+type dirEntry struct {
+	info *fileInfo
+}
+
+func (e *dirEntry) Name() string               { return e.info.name }
+func (e *dirEntry) IsDir() bool                { return e.info.dir }
+func (e *dirEntry) Type() fs.FileMode          { return e.info.Mode().Type() }
+func (e *dirEntry) Info() (fs.FileInfo, error) { return e.info, nil }
+
+var _ os.DirEntry = &dirEntry{}
+
+// RestrictedCopy creates an on-disk copy of the generated security asset
 // with the provided path. The copy will be created in the provided directory.
-// Returns the path of the file and a cleanup function that will delete the file.
+// Returns the path of the created file.
 //
 // The file will have restrictive file permissions (0600), making it
 // appropriate for usage by libraries that require security assets to have such
 // restrictive permissions.
-func RestrictedCopy(t testing.TB, path, tempdir, name string) string {
-	contents, err := Asset(path)
-	if err != nil {
-		t.Fatal(err)
+func RestrictedCopy(path, tempdir, name string) (string, error) {
+	contents, ok := generatedCerts()[path]
+	if !ok {
+		return "", errors.Wrapf(os.ErrNotExist,
+			"securitytest: asset not found: %s", path)
 	}
 	tempPath := filepath.Join(tempdir, name)
-	if err := ioutil.WriteFile(tempPath, contents, 0600); err != nil {
-		t.Fatal(err)
+	if err := os.WriteFile(tempPath, contents, 0600); err != nil {
+		return "", err
 	}
-	return tempPath
+	return tempPath, nil
 }
 
-// AssetReadDir mimics ioutil.ReadDir, returning a list of []os.FileInfo for
-// the specified directory.
-func AssetReadDir(name string) ([]os.FileInfo, error) {
-	names, err := AssetDir(name)
+// AppendFile appends the generated security asset with the provided path
+// to the file designated by the second path.
+func AppendFile(assetPath, dstPath string) error {
+	contents, ok := generatedCerts()[assetPath]
+	if !ok {
+		return errors.Wrapf(os.ErrNotExist,
+			"securitytest: asset not found: %s", assetPath)
+	}
+	f, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_APPEND, 0 /* unused */)
 	if err != nil {
-		if strings.HasSuffix(err.Error(), "not found") {
-			return nil, os.ErrNotExist
-		}
-		return nil, err
+		return err
 	}
-	infos := make([]os.FileInfo, len(names))
-	for i, n := range names {
-		info, err := AssetInfo(filepath.Join(name, n))
-		if err != nil {
-			return nil, err
-		}
-		// Convert back to bindataFileInfo and strip directory from filename.
-		binInfo := info.(bindataFileInfo)
-		binInfo.name = filepath.Base(binInfo.name)
-		infos[i] = binInfo
-	}
-	return infos, nil
+	_, err = f.Write(contents)
+	return errors.CombineErrors(err, f.Close())
 }
 
-// AssetStat wraps AssetInfo, but returns os.ErrNotExist if the requested
-// file is not found.
+// AssetReadDir returns a list of []os.DirEntry for the specified directory
+// within the generated certificate store.
+func AssetReadDir(name string) ([]os.DirEntry, error) {
+	certs := generatedCerts()
+	prefix := name + "/"
+	var entries []os.DirEntry
+
+	for path, data := range certs {
+		if !strings.HasPrefix(path, prefix) {
+			continue
+		}
+		remainder := strings.TrimPrefix(path, prefix)
+		// Only include direct children, not nested paths.
+		if strings.Contains(remainder, "/") {
+			continue
+		}
+		entries = append(entries, &dirEntry{
+			info: &fileInfo{name: remainder, size: int64(len(data))},
+		})
+	}
+
+	if len(entries) == 0 {
+		return nil, errors.Wrapf(os.ErrNotExist,
+			"securitytest: directory not found: %s", name)
+	}
+
+	// Sort alphabetically for deterministic ordering (matches embed.FS behavior).
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name() < entries[j].Name()
+	})
+	return entries, nil
+}
+
+// AssetStat returns file info for the named asset.
 func AssetStat(name string) (os.FileInfo, error) {
-	info, err := AssetInfo(name)
-	if err != nil && strings.HasSuffix(err.Error(), "not found") {
-		return info, os.ErrNotExist
+	certs := generatedCerts()
+	if data, ok := certs[name]; ok {
+		return &fileInfo{
+			name: filepath.Base(name),
+			size: int64(len(data)),
+		}, nil
 	}
-	return info, err
+	// Check if this is a directory by looking for entries with this prefix.
+	prefix := name + "/"
+	for path := range certs {
+		if strings.HasPrefix(path, prefix) {
+			return &fileInfo{
+				name: filepath.Base(name),
+				dir:  true,
+			}, nil
+		}
+	}
+	return nil, errors.Wrapf(os.ErrNotExist,
+		"securitytest: asset not found: %s", name)
 }
 
-// EmbeddedAssets is an AssetLoader pointing to embedded asset functions.
-var EmbeddedAssets = security.AssetLoader{
+// Asset returns the PEM-encoded bytes for the named certificate or key.
+func Asset(name string) ([]byte, error) {
+	if data, ok := generatedCerts()[name]; ok {
+		return data, nil
+	}
+	return nil, errors.Wrapf(os.ErrNotExist,
+		"securitytest: asset not found: %s", name)
+}
+
+// EmbeddedAssets is an AssetLoader backed by runtime-generated certificates.
+var EmbeddedAssets = securityassets.Loader{
 	ReadDir:  AssetReadDir,
 	ReadFile: Asset,
 	Stat:     AssetStat,

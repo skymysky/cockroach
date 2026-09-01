@@ -1,80 +1,53 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
-	"bytes"
+	"context"
 
-	"golang.org/x/net/context"
-
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // filterNode implements a filtering stage. It is intended to be used
 // during plan optimizations in order to avoid instantiating a fully
 // blown selectTopNode/renderNode pair.
 type filterNode struct {
-	p          *planner
-	source     planDataSource
-	filter     parser.TypedExpr
-	ivarHelper parser.IndexedVarHelper
+	singleInputPlanNode
+	columns     colinfo.ResultColumns
+	filter      tree.TypedExpr
+	reqOrdering ReqOrdering
 }
 
-// IndexedVarEval implements the parser.IndexedVarContainer interface.
-func (f *filterNode) IndexedVarEval(idx int, ctx *parser.EvalContext) (parser.Datum, error) {
-	return f.source.plan.Values()[idx].Eval(ctx)
+// filterNode implements eval.IndexedVarContainer
+var _ eval.IndexedVarContainer = &filterNode{}
+
+// IndexedVarEval implements the eval.IndexedVarContainer interface.
+func (f *filterNode) IndexedVarEval(idx int) (tree.Datum, error) {
+	return f.input.Values()[idx], nil
 }
 
-// IndexedVarResolvedType implements the parser.IndexedVarContainer interface.
-func (f *filterNode) IndexedVarResolvedType(idx int) parser.Type {
-	return f.source.info.sourceColumns[idx].Typ
+// IndexedVarResolvedType implements the tree.IndexedVarContainer interface.
+func (f *filterNode) IndexedVarResolvedType(idx int) *types.T {
+	return f.columns[idx].Typ
 }
 
-// IndexedVarFormat implements the parser.IndexedVarContainer interface.
-func (f *filterNode) IndexedVarFormat(buf *bytes.Buffer, fl parser.FmtFlags, idx int) {
-	f.source.info.FormatVar(buf, fl, idx)
-}
-
-// Start implements the planNode interface.
-func (f *filterNode) Start(ctx context.Context) error {
-	return f.source.plan.Start(ctx)
+func (f *filterNode) startExec(runParams) error {
+	return nil
 }
 
 // Next implements the planNode interface.
-func (f *filterNode) Next(ctx context.Context) (bool, error) {
-	for {
-		if next, err := f.source.plan.Next(ctx); !next {
-			return false, err
-		}
-
-		passesFilter, err := sqlbase.RunFilter(f.filter, &f.p.evalCtx)
-		if err != nil {
-			return false, err
-		}
-
-		if passesFilter {
-			return true, nil
-		}
-		// Row was filtered out; grab the next row.
-	}
+func (f *filterNode) Next(params runParams) (bool, error) {
+	panic("filterNode cannot be run in local mode")
 }
 
-func (f *filterNode) Close(ctx context.Context) {
-	f.source.plan.Close(ctx)
+func (f *filterNode) Values() tree.Datums {
+	panic("filterNode cannot be run in local mode")
 }
-func (f *filterNode) Values() parser.Datums { return f.source.plan.Values() }
+
+func (f *filterNode) Close(ctx context.Context) { f.input.Close(ctx) }
